@@ -8,6 +8,8 @@ import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.Matrix
+import android.graphics.Rect
+import android.graphics.RectF
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.media.AudioManager
@@ -38,7 +40,12 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
+import androidx.camera.core.Camera
 import androidx.camera.core.Preview
+import androidx.camera.core.UseCaseGroup
+import androidx.camera.core.resolutionselector.AspectRatioStrategy
+import androidx.camera.core.resolutionselector.ResolutionSelector
+import androidx.camera.core.resolutionselector.ResolutionStrategy
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
@@ -94,8 +101,15 @@ class MainActivity : ComponentActivity() {
     private val reads = ArrayList<Pair<Long, String>>()
     private var lastAccepted = ""
     private var lastAcceptedTime = 0L
-    private var lastAnalyze = 0L
     private var cameraStarted = false
+    private var pendingCameraStart = false
+    @Volatile private var busy = false
+    private var camera: Camera? = null
+    private var torchOn = false
+    private var avgMs = 0f
+    private var lastDecideMs = 0L
+    private lateinit var tvSpeed: TextView
+    private lateinit var btnTorch: Button
 
     private val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
     private val executor = Executors.newSingleThreadExecutor()
@@ -220,6 +234,10 @@ class MainActivity : ComponentActivity() {
             lp.leftMargin = (pvW * gLeft).toInt()
             lp.topMargin = (pvH * gTop).toInt()
             guide.post { guide.layoutParams = lp }
+            if (pendingCameraStart && pvW > 0) {
+                pendingCameraStart = false
+                previewView.post { startCamera() }
+            }
         }
         guide = View(this).apply { background = GradientDrawable().apply {
             setColor(Color.TRANSPARENT)
@@ -227,14 +245,21 @@ class MainActivity : ComponentActivity() {
             setStroke(dp(3), Color.WHITE)
         } }
         previewFrame.addView(guide, FrameLayout.LayoutParams(dp(260), dp(120)))
-        val guideText = TextView(this).apply {
-            text = "車牌放進框內，離近一點"
-            textSize = 13f
+        tvSpeed = TextView(this).apply {
+            text = "車牌放進框內"
+            textSize = 12f
             setTextColor(Color.WHITE)
-            setBackgroundColor(Color.parseColor("#88000000"))
-            setPadding(dp(8), dp(2), dp(8), dp(2))
+            setBackgroundColor(Color.parseColor("#99000000"))
+            setPadding(dp(6), dp(2), dp(6), dp(2))
         }
-        previewFrame.addView(guideText, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL).apply { bottomMargin = dp(6) })
+        previewFrame.addView(tvSpeed, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM or Gravity.START).apply { leftMargin = dp(6); bottomMargin = dp(6) })
+        btnTorch = button("補光", Color.parseColor("#99000000"), Color.WHITE, 13f).apply {
+            minHeight = dp(36); minimumHeight = dp(36)
+            setPadding(dp(12), 0, dp(12), 0)
+            visibility = View.GONE
+        }
+        btnTorch.setOnClickListener { toggleTorch() }
+        previewFrame.addView(btnTorch, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(36), Gravity.BOTTOM or Gravity.END).apply { rightMargin = dp(6); bottomMargin = dp(6) })
         root.addView(previewFrame, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 2.2f).apply { topMargin = dp(8) })
 
         statusBox = LinearLayout(this).apply {
@@ -500,21 +525,35 @@ class MainActivity : ComponentActivity() {
     // ---------- camera ----------
     private fun startCamera() {
         if (cameraStarted) return
+        if (pvW == 0) { pendingCameraStart = true; return }  // wait until the preview has its size
         cameraStarted = true
         val future = ProcessCameraProvider.getInstance(this)
         future.addListener({
             try {
                 val provider = future.get()
-                val preview = Preview.Builder().build()
+                val ratio43 = AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY
+                val preview = Preview.Builder()
+                    .setResolutionSelector(ResolutionSelector.Builder().setAspectRatioStrategy(ratio43).build())
+                    .build()
                 preview.setSurfaceProvider(previewView.surfaceProvider)
-                @Suppress("DEPRECATION")
                 val analysis = ImageAnalysis.Builder()
                     .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                    .setTargetResolution(Size(1920, 1080))
+                    .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
+                    .setResolutionSelector(
+                        ResolutionSelector.Builder()
+                            .setAspectRatioStrategy(ratio43)
+                            .setResolutionStrategy(ResolutionStrategy(Size(1440, 1080), ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER))
+                            .build()
+                    )
                     .build()
                 analysis.setAnalyzer(executor) { proxy -> analyze(proxy) }
+                // The view port makes the analysed image cover exactly what the preview shows.
+                val group = UseCaseGroup.Builder().addUseCase(preview).addUseCase(analysis)
+                previewView.viewPort?.let { group.setViewPort(it) }
                 provider.unbindAll()
-                provider.bindToLifecycle(this@MainActivity, CameraSelector.DEFAULT_BACK_CAMERA, preview, analysis)
+                val cam = provider.bindToLifecycle(this@MainActivity, CameraSelector.DEFAULT_BACK_CAMERA, group.build())
+                camera = cam
+                btnTorch.visibility = if (cam.cameraInfo.hasFlashUnit()) View.VISIBLE else View.GONE
             } catch (e: Exception) {
                 cameraStarted = false
                 showStatus("warn", "相機無法啟動", "", "請直接輸入車牌。", emptyList(), false)
@@ -522,72 +561,127 @@ class MainActivity : ComponentActivity() {
         }, ContextCompat.getMainExecutor(this))
     }
 
-    /** Read only the strip inside the guide frame, at the camera's full resolution. */
+    private fun toggleTorch() {
+        val cam = camera ?: return
+        torchOn = !torchOn
+        cam.cameraControl.enableTorch(torchOn)
+        btnTorch.background = rounded(if (torchOn) cWarn else Color.parseColor("#99000000"))
+        btnTorch.setTextColor(if (torchOn) Color.BLACK else Color.WHITE)
+    }
+
+    /**
+     * Read only the guide-frame area. Frames are processed back to back:
+     * the next one starts as soon as the previous recognition finishes.
+     */
     private fun analyze(proxy: ImageProxy) {
-        val now = SystemClock.elapsedRealtime()
-        if (!scanOn || now - lastAnalyze < 450) {
+        if (!scanOn || busy) {
             proxy.close()
             return
         }
-        lastAnalyze = now
+        busy = true
+        val started = SystemClock.elapsedRealtime()
+        val rot = proxy.imageInfo.rotationDegrees
         var crop: Bitmap? = null
         try {
             val src = proxy.toBitmap()
-            val m = Matrix().apply { postRotate(proxy.imageInfo.rotationDegrees.toFloat()) }
-            val rotated = Bitmap.createBitmap(src, 0, 0, src.width, src.height, m, true)
-            val imgW = rotated.width
-            val imgH = rotated.height
-            var left = imgW / 10
-            var top = imgH * 3 / 10
-            var right = imgW * 9 / 10
-            var bottom = imgH * 6 / 10
-            val vw = pvW
-            val vh = pvH
-            if (vw > 0 && vh > 0) {
-                // Map the guide frame (preview pixels) back onto the camera image (the preview fills and centre-crops).
-                val scale = max(vw.toFloat() / imgW, vh.toFloat() / imgH)
-                left = (((vw * gLeft) - vw / 2f) / scale + imgW / 2f).toInt()
-                right = (((vw * (gLeft + gWidth)) - vw / 2f) / scale + imgW / 2f).toInt()
-                top = (((vh * gTop) - vh / 2f) / scale + imgH / 2f).toInt()
-                bottom = (((vh * (gTop + gHeight)) - vh / 2f) / scale + imgH / 2f).toInt()
-            }
-            left = max(0, left)
-            top = max(0, top)
-            right = minOf(imgW, right)
-            bottom = minOf(imgH, bottom)
-            crop = if (right - left < 50 || bottom - top < 50) rotated else Bitmap.createBitmap(rotated, left, top, right - left, bottom - top)
+            val r = guideRect(src, proxy, rot)
+            crop = Bitmap.createBitmap(src, r.left, r.top, r.width(), r.height())
         } catch (e: Exception) {
             crop = null
         } finally {
             proxy.close()
         }
-        val bmp = crop ?: return
-        recognizer.process(InputImage.fromBitmap(bmp, 0))
-            .addOnSuccessListener { r ->
-                val p = PlateLogic.extract(r.text)
-                if (p != null) runOnUiThread { onSeen(p) }
-            }
+        val bmp = crop
+        if (bmp == null) {
+            busy = false
+            return
+        }
+        recognizer.process(InputImage.fromBitmap(bmp, rot))
+            .addOnSuccessListener { res -> onFrame(PlateLogic.extract(res.text), started) }
+            .addOnCompleteListener { busy = false }
     }
 
-    /** Take a plate only when it clearly wins the vote among the last few seconds of reads. */
-    private fun onSeen(p: String) {
+    /** The guide frame mapped into the (unrotated) camera bitmap. */
+    private fun guideRect(src: Bitmap, proxy: ImageProxy, rot: Int): Rect {
+        // Visible part of the camera image. toBitmap() may or may not have applied the crop already.
+        val vis = if (src.width == proxy.width && src.height == proxy.height) Rect(proxy.cropRect) else Rect(0, 0, src.width, src.height)
+        val visW = vis.width().toFloat()
+        val visH = vis.height().toFloat()
+        val upright = rot == 90 || rot == 270
+        val w = if (upright) visH else visW
+        val h = if (upright) visW else visH
+        val vw = pvW.toFloat()
+        val vh = pvH.toFloat()
+        val rf = if (vw > 0f && vh > 0f) {
+            // Preview fills the view and centre-crops; with a view port the two have the same shape.
+            val sc = max(vw / w, vh / h)
+            RectF(
+                (vw * gLeft - vw / 2f) / sc + w / 2f,
+                (vh * gTop - vh / 2f) / sc + h / 2f,
+                (vw * (gLeft + gWidth) - vw / 2f) / sc + w / 2f,
+                (vh * (gTop + gHeight) - vh / 2f) / sc + h / 2f
+            )
+        } else RectF(w * 0.1f, h * 0.3f, w * 0.9f, h * 0.6f)
+        // Undo the rotation: upright coordinates -> bitmap coordinates.
+        val m = Matrix()
+        m.postRotate(rot.toFloat())
+        val b = RectF(0f, 0f, visW, visH)
+        m.mapRect(b)
+        m.postTranslate(-b.left, -b.top)
+        val inv = Matrix()
+        m.invert(inv)
+        inv.mapRect(rf)
+        val out = Rect(
+            (vis.left + rf.left).toInt().coerceIn(0, src.width - 1),
+            (vis.top + rf.top).toInt().coerceIn(0, src.height - 1),
+            (vis.left + rf.right).toInt().coerceIn(1, src.width),
+            (vis.top + rf.bottom).toInt().coerceIn(1, src.height)
+        )
+        if (out.width() < 50 || out.height() < 50) return Rect(0, 0, src.width, src.height)
+        return out
+    }
+
+    private fun onFrame(p: String?, started: Long) {
+        val ms = SystemClock.elapsedRealtime() - started
+        avgMs = if (avgMs == 0f) ms.toFloat() else avgMs * 0.8f + ms * 0.2f
+        updateSpeed()
+        if (p != null) onSeen(p, started)
+    }
+
+    private fun updateSpeed() {
+        val sb = StringBuilder("每張 ").append(avgMs.toInt()).append(" 毫秒")
+        if (lastDecideMs > 0) sb.append(" · 判定 ").append(String.format(Locale.US, "%.2f", lastDecideMs / 1000f)).append(" 秒")
+        tvSpeed.text = sb.toString()
+    }
+
+    /**
+     * A plate already on today's list is taken from a single read, so green results are instant.
+     * A plate not on the list needs two identical reads with no competing reading, so a misread
+     * is not recorded or reported as unticketed.
+     */
+    private fun onSeen(raw: String, started: Long) {
         if (awaiting) return
         val now = SystemClock.elapsedRealtime()
-        reads.add(now to p)
-        reads.removeAll { now - it.first > 3000 }
-        val counts = reads.groupingBy { it.second }.eachCount()
-        val top = counts.maxByOrNull { it.value } ?: return
-        val second = counts.filter { it.key != top.key }.values.maxOrNull() ?: 0
-        if (top.value < 2 || (top.value < 3 && second > 0)) return
-        val plate = top.key
-        reads.clear()
-        if (plate == lastAccepted && now - lastAcceptedTime < 5000) {
+        val plate = learn.fix(raw)
+        // Same car still in front of the camera, including small misreads of it: ignore.
+        if (lastAccepted.isNotEmpty() && now - lastAcceptedTime < 2500 &&
+            (plate == lastAccepted || PlateLogic.fold(plate) == PlateLogic.fold(lastAccepted) || PlateLogic.lev1(plate, lastAccepted))
+        ) {
             lastAcceptedTime = now
             return
         }
+        reads.add(started to raw)
+        reads.removeAll { now - it.first > 1500 }
+        val known = store.find(plate) != null
+        val n = reads.count { it.second == raw }
+        val rival = reads.groupingBy { it.second }.eachCount().any { it.key != raw && it.value >= n }
+        if (!known && (n < 2 || rival)) return
+        lastDecideMs = now - reads.filter { it.second == raw }.minOf { it.first }
+        updateSpeed()
+        reads.clear()
         lastAccepted = plate
         lastAcceptedTime = now
-        submit(learn.fix(plate), plate)
+        submit(plate, raw)
     }
 
     // ---------- menu actions ----------
