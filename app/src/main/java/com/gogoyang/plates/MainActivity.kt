@@ -5,7 +5,9 @@ import android.app.AlertDialog
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
 import android.graphics.Color
+import android.graphics.Matrix
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.media.AudioManager
@@ -19,12 +21,14 @@ import android.text.InputType
 import android.text.TextWatcher
 import android.util.Size
 import android.view.Gravity
+import android.view.View
 import android.view.ViewGroup
 import android.view.WindowManager
 import android.view.inputmethod.EditorInfo
 import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.EditText
+import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ListView
 import android.widget.TextView
@@ -45,6 +49,7 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.concurrent.Executors
+import kotlin.math.max
 
 class MainActivity : ComponentActivity() {
 
@@ -56,8 +61,14 @@ class MainActivity : ComponentActivity() {
     private val cNo = Color.parseColor("#C62828")
     private val cWarn = Color.parseColor("#E0A100")
 
+    // Share of the camera image that is read: a wide, short strip in the middle.
+    private val cropW = 0.76f
+    private val cropH = 0.24f
+
     private lateinit var store: Store
+    private lateinit var learn: Learn
     private lateinit var previewView: PreviewView
+    private lateinit var guide: View
     private lateinit var statusBox: LinearLayout
     private lateinit var tvLabel: TextView
     private lateinit var tvPlate: TextView
@@ -74,13 +85,13 @@ class MainActivity : ComponentActivity() {
     private var mode = "mark"
     private var scanOn = true
     private var awaiting = false
-    private var lastSeen = ""
-    private var seenCount = 0
-    private var seenTime = 0L
+    private var lastRaw = ""
+    private val reads = ArrayList<Pair<Long, String>>()
     private var lastAccepted = ""
     private var lastAcceptedTime = 0L
     private var lastAnalyze = 0L
     private var cameraStarted = false
+    private var guideSized = false
 
     private val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
     private val executor = Executors.newSingleThreadExecutor()
@@ -96,6 +107,7 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         store = Store(this)
         store.load(todayStr())
+        learn = Learn(this)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         setContentView(buildUi())
         refreshList()
@@ -194,8 +206,24 @@ class MainActivity : ComponentActivity() {
         modeRow.addView(btnScan, mp())
         root.addView(modeRow, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(8) })
 
-        previewView = PreviewView(this).apply { background = rounded(Color.BLACK, 12) }
-        root.addView(previewView, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 2.2f).apply { topMargin = dp(8) })
+        val previewFrame = FrameLayout(this).apply { background = rounded(Color.BLACK, 12) }
+        previewView = PreviewView(this)
+        previewFrame.addView(previewView, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+        guide = View(this).apply { background = GradientDrawable().apply {
+            setColor(Color.TRANSPARENT)
+            cornerRadius = dp(8).toFloat()
+            setStroke(dp(3), Color.WHITE)
+        } }
+        previewFrame.addView(guide, FrameLayout.LayoutParams(dp(260), dp(90), Gravity.CENTER))
+        val guideText = TextView(this).apply {
+            text = "車牌放進框內，離近一點"
+            textSize = 13f
+            setTextColor(Color.WHITE)
+            setBackgroundColor(Color.parseColor("#88000000"))
+            setPadding(dp(8), dp(2), dp(8), dp(2))
+        }
+        previewFrame.addView(guideText, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.TOP or Gravity.CENTER_HORIZONTAL).apply { topMargin = dp(6) })
+        root.addView(previewFrame, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 2.2f).apply { topMargin = dp(8) })
 
         statusBox = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -250,7 +278,7 @@ class MainActivity : ComponentActivity() {
             divider = null
         }
         adapter = object : ArrayAdapter<String>(this, android.R.layout.simple_list_item_1) {
-            override fun getView(position: Int, convertView: android.view.View?, parent: ViewGroup): android.view.View {
+            override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
                 val v = super.getView(position, convertView, parent) as TextView
                 v.textSize = 22f
                 v.typeface = Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD)
@@ -262,9 +290,13 @@ class MainActivity : ComponentActivity() {
         listView.setOnItemClickListener { _, _, pos, _ ->
             val rec = store.records.getOrNull(pos) ?: return@setOnItemClickListener
             AlertDialog.Builder(this)
-                .setMessage("刪除 " + PlateLogic.format(rec.plate) + "？")
-                .setPositiveButton("刪除") { _, _ -> store.remove(rec); refreshList() }
-                .setNegativeButton("取消", null)
+                .setTitle(PlateLogic.format(rec.plate))
+                .setItems(arrayOf("修改車牌", "刪除", "取消")) { _, which ->
+                    when (which) {
+                        0 -> askCorrect(rec.plate, rec.raw) { truth -> store.replace(rec, truth); refreshList() }
+                        1 -> { store.remove(rec); refreshList() }
+                    }
+                }
                 .show()
         }
         root.addView(listView, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1.6f).apply { topMargin = dp(6) })
@@ -304,7 +336,10 @@ class MainActivity : ComponentActivity() {
         if (mode == "mark") "開完一台，對準車牌或輸入車牌，就記錄為已開單。"
         else "對準車牌或輸入車牌，馬上顯示有沒有開過單。"
 
-    private fun showIdle() = showStatus("idle", "準備就緒", "", idleText(), emptyList(), false)
+    private fun showIdle() {
+        lastRaw = ""
+        showStatus("idle", "準備就緒", "", idleText(), emptyList(), false)
+    }
 
     private fun showStatus(kind: String, label: String, plate: String, detail: String, actions: List<Pair<String, () -> Unit>>, hold: Boolean) {
         awaiting = hold
@@ -319,10 +354,17 @@ class MainActivity : ComponentActivity() {
         tvLabel.setTextColor(fg)
         tvDetail.text = detail
         tvDetail.setTextColor(fg)
-        tvPlate.visibility = if (plate.isEmpty()) android.view.View.GONE else android.view.View.VISIBLE
+        tvPlate.visibility = if (plate.isEmpty()) View.GONE else View.VISIBLE
         tvPlate.text = PlateLogic.format(plate)
+
+        // Plates read by the camera can be corrected; the correction is remembered.
+        val shown = actions.toMutableList()
+        if (plate.isNotEmpty() && lastRaw.isNotEmpty() && !hold) {
+            val fix: Pair<String, () -> Unit> = "更正車牌" to { correctDisplayed(plate) }
+            shown.add(fix)
+        }
         actionsRow.removeAllViews()
-        actions.forEachIndexed { i, a ->
+        shown.forEachIndexed { i, a ->
             val b = button(a.first, if (i == 0) Color.WHITE else Color.TRANSPARENT, if (i == 0) Color.BLACK else fg, 15f)
             if (i != 0) b.background = rounded(Color.TRANSPARENT, 12, fg, 2)
             b.setOnClickListener { a.second() }
@@ -347,6 +389,55 @@ class MainActivity : ComponentActivity() {
         } catch (e: Exception) { }
     }
 
+    // ---------- corrections ----------
+    private fun askCorrect(current: String, raw: String, onDone: (String) -> Unit) {
+        val et = EditText(this).apply {
+            setText(current)
+            setSelection(text.length)
+            textSize = 24f
+            typeface = Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD)
+            setSingleLine()
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+        }
+        val box = FrameLayout(this).apply { setPadding(dp(20), dp(8), dp(20), 0); addView(et) }
+        AlertDialog.Builder(this)
+            .setTitle("更正車牌")
+            .setMessage("改成實車上的車牌。這次更正會被記住，下次同樣讀錯會自動改正。")
+            .setView(box)
+            .setPositiveButton("儲存") { _, _ ->
+                val truth = PlateLogic.normalize(et.text.toString())
+                if (truth.length < 3) {
+                    Toast.makeText(this, "請輸入至少 3 碼車牌", Toast.LENGTH_SHORT).show()
+                } else {
+                    if (raw.isNotEmpty() && raw != truth) learn.teach(raw, truth)
+                    onDone(truth)
+                }
+            }
+            .setNegativeButton("取消", null)
+            .show()
+    }
+
+    private fun correctDisplayed(shown: String) {
+        val raw = lastRaw
+        askCorrect(shown, raw) { truth ->
+            if (mode == "mark") {
+                val rec = store.records.firstOrNull { it.plate == shown && it.raw == raw }
+                if (rec != null) {
+                    store.replace(rec, truth)
+                    refreshList()
+                    lastRaw = ""
+                    showStatus("ok", "已更正", truth, "已改成這個車牌，下次同樣讀錯會自動改正", emptyList(), false)
+                } else {
+                    lastRaw = ""
+                    submit(truth)
+                }
+            } else {
+                lastRaw = ""
+                submit(truth)
+            }
+        }
+    }
+
     // ---------- core flow ----------
     private fun showFound(r: Rec) =
         showStatus("ok", "已開單", r.plate, hhmm(r.t) + " 開單 · " + ago(r.t), emptyList(), false)
@@ -355,17 +446,21 @@ class MainActivity : ComponentActivity() {
         showStatus("ok", "已記錄", r.plate, "今天第 " + store.records.size + " 台",
             listOf("復原" to { store.remove(r); refreshList(); showIdle() }), false)
 
-    private fun showMissing(n: String) =
+    private fun showMissing(n: String) {
+        val rr = lastRaw
         showStatus("no", "未開單", n, "今天沒有這台的記錄",
-            listOf("標記為已開單" to { val r = store.add(n); refreshList(); showRecorded(r) }), false)
+            listOf("標記為已開單" to { val r = store.add(n, rr); refreshList(); showRecorded(r) }), false)
+    }
 
-    private fun submit(raw: String) {
+    /** [readRaw] is what the camera read; empty for typed entries. */
+    private fun submit(raw: String, readRaw: String = "") {
         if (store.date != todayStr()) { store.reset(todayStr()); refreshList() }
         val n = PlateLogic.normalize(raw)
         if (n.length < 3) {
             Toast.makeText(this, "請輸入至少 3 碼車牌", Toast.LENGTH_SHORT).show()
             return
         }
+        lastRaw = readRaw
         etPlate.setText("")
         val exact = store.find(n)
         val near = if (exact == null) PlateLogic.findNear(n, store.records) else emptyList()
@@ -374,9 +469,9 @@ class MainActivity : ComponentActivity() {
                 exact != null -> showStatus("warn", "這台已記錄過", n, hhmm(exact.t) + " 已記錄，沒有重複新增", emptyList(), false)
                 near.isNotEmpty() -> showStatus("warn", "有相似車牌", n,
                     "已記錄的 " + PlateLogic.format(near[0].plate) + "（" + hhmm(near[0].t) + "）很像，是同一台嗎？",
-                    listOf("不同台，新增" to { val r = store.add(n); refreshList(); showRecorded(r) },
+                    listOf("不同台，新增" to { val r = store.add(n, readRaw); refreshList(); showRecorded(r) },
                         "同一台，不新增" to { showFound(near[0]) }), true)
-                else -> { val r = store.add(n); refreshList(); showRecorded(r) }
+                else -> { val r = store.add(n, readRaw); refreshList(); showRecorded(r) }
             }
         } else {
             when {
@@ -403,7 +498,7 @@ class MainActivity : ComponentActivity() {
                 @Suppress("DEPRECATION")
                 val analysis = ImageAnalysis.Builder()
                     .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                    .setTargetResolution(Size(1280, 720))
+                    .setTargetResolution(Size(1920, 1080))
                     .build()
                 analysis.setAnalyzer(executor) { proxy -> analyze(proxy) }
                 provider.unbindAll()
@@ -415,39 +510,73 @@ class MainActivity : ComponentActivity() {
         }, ContextCompat.getMainExecutor(this))
     }
 
-    @androidx.annotation.OptIn(androidx.camera.core.ExperimentalGetImage::class)
+    /** Read only the strip inside the guide frame, at the camera's full resolution. */
     private fun analyze(proxy: ImageProxy) {
         val now = SystemClock.elapsedRealtime()
-        val media = proxy.image
-        if (!scanOn || media == null || now - lastAnalyze < 450) {
+        if (!scanOn || now - lastAnalyze < 450) {
             proxy.close()
             return
         }
         lastAnalyze = now
-        val img = InputImage.fromMediaImage(media, proxy.imageInfo.rotationDegrees)
-        recognizer.process(img)
+        var crop: Bitmap? = null
+        var imgW = 0
+        var imgH = 0
+        try {
+            val src = proxy.toBitmap()
+            val m = Matrix().apply { postRotate(proxy.imageInfo.rotationDegrees.toFloat()) }
+            val rotated = Bitmap.createBitmap(src, 0, 0, src.width, src.height, m, true)
+            imgW = rotated.width
+            imgH = rotated.height
+            val cw = (imgW * cropW).toInt()
+            val ch = (imgH * cropH).toInt()
+            crop = Bitmap.createBitmap(rotated, (imgW - cw) / 2, (imgH - ch) / 2, cw, ch)
+        } catch (e: Exception) {
+            crop = null
+        } finally {
+            proxy.close()
+        }
+        val bmp = crop ?: return
+        if (!guideSized && imgW > 0) {
+            guideSized = true
+            runOnUiThread { sizeGuide(imgW, imgH) }
+        }
+        recognizer.process(InputImage.fromBitmap(bmp, 0))
             .addOnSuccessListener { r ->
                 val p = PlateLogic.extract(r.text)
                 if (p != null) runOnUiThread { onSeen(p) }
             }
-            .addOnCompleteListener { proxy.close() }
     }
 
-    /** Accept a plate once it has been read twice in a row, and not again while the same car stays in view. */
+    /** Draw the guide frame over exactly the area that is read (PreviewView fills and centre-crops). */
+    private fun sizeGuide(imgW: Int, imgH: Int) {
+        val vw = previewView.width
+        val vh = previewView.height
+        if (vw == 0 || vh == 0) { guideSized = false; return }
+        val scale = max(vw.toFloat() / imgW, vh.toFloat() / imgH)
+        val gw = minOf((imgW * cropW * scale).toInt(), vw)
+        val gh = minOf((imgH * cropH * scale).toInt(), vh)
+        guide.layoutParams = FrameLayout.LayoutParams(gw, gh, Gravity.CENTER)
+    }
+
+    /** Take a plate only when it clearly wins the vote among the last few seconds of reads. */
     private fun onSeen(p: String) {
         if (awaiting) return
         val now = SystemClock.elapsedRealtime()
-        if (p == lastSeen && now - seenTime < 2500) seenCount++ else { lastSeen = p; seenCount = 1 }
-        seenTime = now
-        if (seenCount < 2) return
-        if (p == lastAccepted && now - lastAcceptedTime < 5000) {
+        reads.add(now to p)
+        reads.removeAll { now - it.first > 3000 }
+        val counts = reads.groupingBy { it.second }.eachCount()
+        val top = counts.maxByOrNull { it.value } ?: return
+        val second = counts.filter { it.key != top.key }.values.maxOrNull() ?: 0
+        if (top.value < 2 || (top.value < 3 && second > 0)) return
+        val plate = top.key
+        reads.clear()
+        if (plate == lastAccepted && now - lastAcceptedTime < 5000) {
             lastAcceptedTime = now
             return
         }
-        lastAccepted = p
+        lastAccepted = plate
         lastAcceptedTime = now
-        seenCount = 0
-        submit(p)
+        submit(learn.fix(plate), plate)
     }
 
     // ---------- menu actions ----------

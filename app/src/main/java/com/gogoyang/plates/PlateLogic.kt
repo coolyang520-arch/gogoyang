@@ -3,7 +3,7 @@ package com.gogoyang.plates
 import java.text.Normalizer
 import kotlin.math.abs
 
-data class Rec(val plate: String, val t: Long)
+data class Rec(val plate: String, val t: Long, val raw: String = "")
 
 object PlateLogic {
     private val toLetter = mapOf('0' to 'O', '1' to 'I', '8' to 'B', '5' to 'S', '2' to 'Z', '6' to 'G')
