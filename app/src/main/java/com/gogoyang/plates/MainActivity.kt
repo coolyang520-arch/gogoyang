@@ -61,9 +61,14 @@ class MainActivity : ComponentActivity() {
     private val cNo = Color.parseColor("#C62828")
     private val cWarn = Color.parseColor("#E0A100")
 
-    // Share of the camera image that is read: a wide, short strip in the middle.
-    private val cropW = 0.76f
-    private val cropH = 0.24f
+    // Guide frame as a share of the preview: wide, tall enough for two-line plates, sitting in the upper part.
+    // The area read by the recognizer is computed from this same frame, so they always match.
+    private val gLeft = 0.04f
+    private val gWidth = 0.92f
+    private val gTop = 0.06f
+    private val gHeight = 0.54f
+    @Volatile private var pvW = 0
+    @Volatile private var pvH = 0
 
     private lateinit var store: Store
     private lateinit var learn: Learn
@@ -91,7 +96,6 @@ class MainActivity : ComponentActivity() {
     private var lastAcceptedTime = 0L
     private var lastAnalyze = 0L
     private var cameraStarted = false
-    private var guideSized = false
 
     private val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
     private val executor = Executors.newSingleThreadExecutor()
@@ -209,12 +213,20 @@ class MainActivity : ComponentActivity() {
         val previewFrame = FrameLayout(this).apply { background = rounded(Color.BLACK, 12) }
         previewView = PreviewView(this)
         previewFrame.addView(previewView, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+        previewView.addOnLayoutChangeListener { _, l, t, r, b, _, _, _, _ ->
+            pvW = r - l
+            pvH = b - t
+            val lp = FrameLayout.LayoutParams((pvW * gWidth).toInt(), (pvH * gHeight).toInt())
+            lp.leftMargin = (pvW * gLeft).toInt()
+            lp.topMargin = (pvH * gTop).toInt()
+            guide.post { guide.layoutParams = lp }
+        }
         guide = View(this).apply { background = GradientDrawable().apply {
             setColor(Color.TRANSPARENT)
             cornerRadius = dp(8).toFloat()
             setStroke(dp(3), Color.WHITE)
         } }
-        previewFrame.addView(guide, FrameLayout.LayoutParams(dp(260), dp(90), Gravity.CENTER))
+        previewFrame.addView(guide, FrameLayout.LayoutParams(dp(260), dp(120)))
         val guideText = TextView(this).apply {
             text = "車牌放進框內，離近一點"
             textSize = 13f
@@ -222,7 +234,7 @@ class MainActivity : ComponentActivity() {
             setBackgroundColor(Color.parseColor("#88000000"))
             setPadding(dp(8), dp(2), dp(8), dp(2))
         }
-        previewFrame.addView(guideText, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.TOP or Gravity.CENTER_HORIZONTAL).apply { topMargin = dp(6) })
+        previewFrame.addView(guideText, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL).apply { bottomMargin = dp(6) })
         root.addView(previewFrame, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 2.2f).apply { topMargin = dp(8) })
 
         statusBox = LinearLayout(this).apply {
@@ -519,43 +531,42 @@ class MainActivity : ComponentActivity() {
         }
         lastAnalyze = now
         var crop: Bitmap? = null
-        var imgW = 0
-        var imgH = 0
         try {
             val src = proxy.toBitmap()
             val m = Matrix().apply { postRotate(proxy.imageInfo.rotationDegrees.toFloat()) }
             val rotated = Bitmap.createBitmap(src, 0, 0, src.width, src.height, m, true)
-            imgW = rotated.width
-            imgH = rotated.height
-            val cw = (imgW * cropW).toInt()
-            val ch = (imgH * cropH).toInt()
-            crop = Bitmap.createBitmap(rotated, (imgW - cw) / 2, (imgH - ch) / 2, cw, ch)
+            val imgW = rotated.width
+            val imgH = rotated.height
+            var left = imgW / 10
+            var top = imgH * 3 / 10
+            var right = imgW * 9 / 10
+            var bottom = imgH * 6 / 10
+            val vw = pvW
+            val vh = pvH
+            if (vw > 0 && vh > 0) {
+                // Map the guide frame (preview pixels) back onto the camera image (the preview fills and centre-crops).
+                val scale = max(vw.toFloat() / imgW, vh.toFloat() / imgH)
+                left = (((vw * gLeft) - vw / 2f) / scale + imgW / 2f).toInt()
+                right = (((vw * (gLeft + gWidth)) - vw / 2f) / scale + imgW / 2f).toInt()
+                top = (((vh * gTop) - vh / 2f) / scale + imgH / 2f).toInt()
+                bottom = (((vh * (gTop + gHeight)) - vh / 2f) / scale + imgH / 2f).toInt()
+            }
+            left = max(0, left)
+            top = max(0, top)
+            right = minOf(imgW, right)
+            bottom = minOf(imgH, bottom)
+            crop = if (right - left < 50 || bottom - top < 50) rotated else Bitmap.createBitmap(rotated, left, top, right - left, bottom - top)
         } catch (e: Exception) {
             crop = null
         } finally {
             proxy.close()
         }
         val bmp = crop ?: return
-        if (!guideSized && imgW > 0) {
-            guideSized = true
-            runOnUiThread { sizeGuide(imgW, imgH) }
-        }
         recognizer.process(InputImage.fromBitmap(bmp, 0))
             .addOnSuccessListener { r ->
                 val p = PlateLogic.extract(r.text)
                 if (p != null) runOnUiThread { onSeen(p) }
             }
-    }
-
-    /** Draw the guide frame over exactly the area that is read (PreviewView fills and centre-crops). */
-    private fun sizeGuide(imgW: Int, imgH: Int) {
-        val vw = previewView.width
-        val vh = previewView.height
-        if (vw == 0 || vh == 0) { guideSized = false; return }
-        val scale = max(vw.toFloat() / imgW, vh.toFloat() / imgH)
-        val gw = minOf((imgW * cropW * scale).toInt(), vw)
-        val gh = minOf((imgH * cropH * scale).toInt(), vh)
-        guide.layoutParams = FrameLayout.LayoutParams(gw, gh, Gravity.CENTER)
     }
 
     /** Take a plate only when it clearly wins the vote among the last few seconds of reads. */
