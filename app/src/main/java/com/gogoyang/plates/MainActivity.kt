@@ -70,10 +70,11 @@ class MainActivity : ComponentActivity() {
 
     // Guide frame as a share of the preview: wide, tall enough for two-line plates, sitting in the upper part.
     // The area read by the recognizer is computed from this same frame, so they always match.
-    private val gLeft = 0.04f
-    private val gWidth = 0.92f
-    private val gTop = 0.06f
-    private val gHeight = 0.54f
+    // Narrow, tall window like the handheld unit: hold the phone close so the plate fills it.
+    private val gLeft = 0.27f
+    private val gWidth = 0.46f
+    private val gTop = 0.04f
+    private val gHeight = 0.80f
     @Volatile private var pvW = 0
     @Volatile private var pvH = 0
 
@@ -81,6 +82,10 @@ class MainActivity : ComponentActivity() {
     private lateinit var learn: Learn
     private lateinit var previewView: PreviewView
     private lateinit var guide: View
+    private lateinit var mask: MaskView
+    private val cands = LinkedHashMap<String, Int>()
+    private var candsTime = 0L
+    private var candKey = ""
     private lateinit var statusBox: LinearLayout
     private lateinit var tvLabel: TextView
     private lateinit var tvPlate: TextView
@@ -233,12 +238,19 @@ class MainActivity : ComponentActivity() {
             val lp = FrameLayout.LayoutParams((pvW * gWidth).toInt(), (pvH * gHeight).toInt())
             lp.leftMargin = (pvW * gLeft).toInt()
             lp.topMargin = (pvH * gTop).toInt()
-            guide.post { guide.layoutParams = lp }
+            val hole = RectF(lp.leftMargin.toFloat(), lp.topMargin.toFloat(), (lp.leftMargin + lp.width).toFloat(), (lp.topMargin + lp.height).toFloat())
+            guide.post {
+                guide.layoutParams = lp
+                mask.hole = hole
+                mask.invalidate()
+            }
             if (pendingCameraStart && pvW > 0) {
                 pendingCameraStart = false
                 previewView.post { startCamera() }
             }
         }
+        mask = MaskView(this)
+        previewFrame.addView(mask, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
         guide = View(this).apply { background = GradientDrawable().apply {
             setColor(Color.TRANSPARENT)
             cornerRadius = dp(8).toFloat()
@@ -260,7 +272,7 @@ class MainActivity : ComponentActivity() {
         }
         btnTorch.setOnClickListener { toggleTorch() }
         previewFrame.addView(btnTorch, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(36), Gravity.BOTTOM or Gravity.END).apply { rightMargin = dp(6); bottomMargin = dp(6) })
-        root.addView(previewFrame, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 2.2f).apply { topMargin = dp(8) })
+        root.addView(previewFrame, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 2.6f).apply { topMargin = dp(8) })
 
         statusBox = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -342,6 +354,7 @@ class MainActivity : ComponentActivity() {
 
     private fun setMode(m: String) {
         mode = m
+        clearCands()
         updateModeUi()
         showIdle()
     }
@@ -378,7 +391,7 @@ class MainActivity : ComponentActivity() {
         showStatus("idle", "準備就緒", "", idleText(), emptyList(), false)
     }
 
-    private fun showStatus(kind: String, label: String, plate: String, detail: String, actions: List<Pair<String, () -> Unit>>, hold: Boolean) {
+    private fun showStatus(kind: String, label: String, plate: String, detail: String, actions: List<Pair<String, () -> Unit>>, hold: Boolean, sound: Boolean = true) {
         awaiting = hold
         val (bg, fg) = when (kind) {
             "ok" -> cOk to Color.WHITE
@@ -401,13 +414,20 @@ class MainActivity : ComponentActivity() {
             shown.add(fix)
         }
         actionsRow.removeAllViews()
+        // Three or more choices (camera candidates) stack as a list of large plate buttons.
+        val list = shown.size > 2 || label == "請點選正確車牌"
+        actionsRow.orientation = if (list) LinearLayout.VERTICAL else LinearLayout.HORIZONTAL
         shown.forEachIndexed { i, a ->
-            val b = button(a.first, if (i == 0) Color.WHITE else Color.TRANSPARENT, if (i == 0) Color.BLACK else fg, 15f)
+            val b = button(a.first, if (i == 0) Color.WHITE else Color.TRANSPARENT, if (i == 0) Color.BLACK else fg, if (list) 24f else 15f)
+            if (list) b.minWidth = dp(220)
             if (i != 0) b.background = rounded(Color.TRANSPARENT, 12, fg, 2)
             b.setOnClickListener { a.second() }
-            actionsRow.addView(b, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { leftMargin = dp(4); rightMargin = dp(4) })
+            actionsRow.addView(b, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                leftMargin = dp(4); rightMargin = dp(4)
+                if (list) { topMargin = dp(3); bottomMargin = dp(3) }
+            })
         }
-        if (kind != "idle") feedback(kind)
+        if (kind != "idle" && sound) feedback(kind)
     }
 
     private fun feedback(kind: String) {
@@ -498,6 +518,7 @@ class MainActivity : ComponentActivity() {
             return
         }
         lastRaw = readRaw
+        clearCands()
         etPlate.setText("")
         val exact = store.find(n)
         val near = if (exact == null) PlateLogic.findNear(n, store.records) else emptyList()
@@ -655,9 +676,9 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
-     * A plate already on today's list is taken from a single read, so green results are instant.
-     * A plate not on the list needs two identical reads with no competing reading, so a misread
-     * is not recorded or reported as unticketed.
+     * Round 1 (record): a plate needs two identical reads with no competing reading, then it is recorded automatically.
+     * Round 2 (check): a plate already on today's list is taken from a single read and shown green at once.
+     * A plate not on the list is offered as a candidate; the officer taps the one that matches the real plate.
      */
     private fun onSeen(raw: String, started: Long) {
         if (awaiting) return
@@ -670,18 +691,59 @@ class MainActivity : ComponentActivity() {
             lastAcceptedTime = now
             return
         }
+        val known = store.find(plate) != null
+        if (mode == "check") {
+            if (known) {
+                lastDecideMs = now - started
+                accept(plate, raw)
+                return
+            }
+            if (now - candsTime > 2000) cands.clear()  // a new car: drop the previous car's candidates
+            candsTime = now
+            cands[raw] = (cands[raw] ?: 0) + 1
+            showCandidates()
+            return
+        }
         reads.add(started to raw)
         reads.removeAll { now - it.first > 1500 }
-        val known = store.find(plate) != null
         val n = reads.count { it.second == raw }
         val rival = reads.groupingBy { it.second }.eachCount().any { it.key != raw && it.value >= n }
         if (!known && (n < 2 || rival)) return
         lastDecideMs = now - reads.filter { it.second == raw }.minOf { it.first }
+        accept(plate, raw)
+    }
+
+    private fun accept(plate: String, raw: String) {
         updateSpeed()
         reads.clear()
         lastAccepted = plate
-        lastAcceptedTime = now
+        lastAcceptedTime = SystemClock.elapsedRealtime()
         submit(plate, raw)
+    }
+
+    private fun clearCands() {
+        cands.clear()
+        candKey = ""
+    }
+
+    private fun showCandidates() {
+        val top = cands.entries.sortedByDescending { it.value }.take(4).map { it.key }
+        val key = top.joinToString(",")
+        if (key == candKey) return  // unchanged: keep the buttons still so a tap is not lost
+        val first = candKey.isEmpty()
+        candKey = key
+        val acts = top.map { raw ->
+            val label: Pair<String, () -> Unit> = PlateLogic.format(learn.fix(raw)) to { pickCandidate(raw) }
+            label
+        }
+        lastRaw = ""
+        showStatus("warn", "請點選正確車牌", "", "今天清單上沒有這台。點實車上的車牌，或直接輸入。", acts, false, first)
+    }
+
+    private fun pickCandidate(raw: String) {
+        val plate = learn.fix(raw)
+        lastDecideMs = 0
+        accept(plate, raw)
     }
 
     // ---------- menu actions ----------
