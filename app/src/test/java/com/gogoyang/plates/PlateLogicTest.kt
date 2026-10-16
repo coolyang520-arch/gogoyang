@@ -50,4 +50,12 @@ class PlateLogicTest {
         assertEquals(1, PlateLogic.search("1234", recs).size)
         assertEquals(1, PlateLogic.search("XYZ", recs).size)
     }
+
+    @Test fun diffCountsChars() {
+        assertEquals(0, PlateLogic.diff("ABC1234", "ABC1234"))
+        assertEquals(0, PlateLogic.diff("ABC1234", "A8C1234"))
+        assertEquals(2, PlateLogic.diff("ABC1234", "ABC1299"))
+        assertEquals(1, PlateLogic.diff("ABC1234", "ABC134"))
+        assertEquals(99, PlateLogic.diff("ABC1234", "AB12"))
+    }
 }

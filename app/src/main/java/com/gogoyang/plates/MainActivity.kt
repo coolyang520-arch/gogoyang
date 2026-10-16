@@ -89,6 +89,7 @@ class MainActivity : ComponentActivity() {
     private var candKey = ""
     private var currentPlate = ""
     private var lastAnyRead = 0L
+    private var acceptedAt = 0L
     private lateinit var statusBox: LinearLayout
     private lateinit var tvLabel: TextView
     private lateinit var tvPlate: TextView
@@ -522,14 +523,23 @@ class MainActivity : ComponentActivity() {
         clearCands()
         etPlate.setText("")
         val exact = store.find(n)
-        val near = if (exact == null) PlateLogic.findNear(n, store.records) else emptyList()
+        var near = if (exact == null) PlateLogic.findNear(n, store.records) else emptyList()
+        if (mode == "mark" && exact == null && near.isEmpty()) {
+            // Recorded in the last minute and differing by at most two characters: probably the same car read differently.
+            val cutoff = System.currentTimeMillis() - 60000
+            near = store.records.filter { it.t >= cutoff && PlateLogic.diff(n, it.plate) <= 2 }
+        }
         if (mode == "mark") {
             when {
                 exact != null -> showStatus("warn", "這台已記錄過", n, hhmm(exact.t) + " 已記錄，沒有重複新增", emptyList(), false)
                 near.isNotEmpty() -> showStatus("warn", "有相似車牌", n,
                     "已記錄的 " + PlateLogic.format(near[0].plate) + "（" + hhmm(near[0].t) + "）很像，是同一台嗎？",
                     listOf("不同台，新增" to { val r = store.add(n, readRaw); refreshList(); showRecorded(r) },
-                        "同一台，不新增" to { showFound(near[0]) }), true)
+                        "同一台，不新增" to {
+                            // The camera misread that car: remember the mix-up so it is recognised next time.
+                            if (readRaw.isNotEmpty()) learn.teach(readRaw, near[0].plate)
+                            showFound(near[0])
+                        }), true)
                 else -> { val r = store.add(n, readRaw); refreshList(); showRecorded(r) }
             }
         } else {
@@ -690,14 +700,16 @@ class MainActivity : ComponentActivity() {
         // A read that differs from a listed plate only by mix-ups the user corrected before is that plate.
         val plate = if (store.find(fixed) != null) fixed
             else store.records.firstOrNull { learn.explains(fixed, it.plate) }?.plate ?: fixed
-        // One car, one plate: after a plate is taken, every reading is ignored while plates keep
-        // being read without a break (the same car seen from other angles). A new car starts once
-        // the window has been empty for a moment. Small misreads of the last plate are ignored too.
-        if (lastAccepted.isNotEmpty() && (gap < 700 ||
-                (now - lastAcceptedTime < 2500 && (plate == lastAccepted || PlateLogic.fold(plate) == PlateLogic.fold(lastAccepted) || PlateLogic.lev1(plate, lastAccepted))))
-        ) {
-            lastAcceptedTime = now
-            return
+        // One car, one plate: right after a plate is taken, ignore everything for a moment, then keep
+        // ignoring readings that differ from it by at most two characters (the same car seen from
+        // another angle) while they keep coming, up to a few seconds. A clearly different plate is a new car.
+        if (lastAccepted.isNotEmpty()) {
+            val sinceTaken = now - acceptedAt
+            if (sinceTaken < 900) return
+            if (PlateLogic.diff(plate, lastAccepted) <= 2 && now - lastAcceptedTime < 2500 && sinceTaken < 6000) {
+                lastAcceptedTime = now
+                return
+            }
         }
         val known = store.find(plate) != null
         if (mode == "check") {
@@ -726,6 +738,7 @@ class MainActivity : ComponentActivity() {
         reads.clear()
         lastAccepted = plate
         lastAcceptedTime = SystemClock.elapsedRealtime()
+        acceptedAt = lastAcceptedTime
         submit(plate, raw)
     }
 

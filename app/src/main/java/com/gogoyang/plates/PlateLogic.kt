@@ -35,6 +35,15 @@ object PlateLogic {
         }
     }
 
+    /** Number of differing characters (look-alikes count as equal); 99 when lengths differ by more than one. */
+    fun diff(a: String, b: String): Int {
+        if (a == b) return 0
+        val fa = fold(a)
+        val fb = fold(b)
+        if (fa.length == fb.length) return fa.indices.count { fa[it] != fb[it] }
+        return if (lev1(fa, fb)) 1 else 99
+    }
+
     fun findNear(n: String, records: List<Rec>): List<Rec> {
         val f = fold(n)
         return records.filter { r ->
