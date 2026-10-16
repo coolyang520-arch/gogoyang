@@ -77,18 +77,46 @@ class Store(ctx: Context) {
 class Learn(ctx: Context) {
     private val sp = ctx.getSharedPreferences("learn", Context.MODE_PRIVATE)
 
-    private fun load(): JSONObject = try { JSONObject(sp.getString("map", "{}")) } catch (e: Exception) { JSONObject() }
+    private fun load(key: String): JSONObject = try { JSONObject(sp.getString(key, "{}")) } catch (e: Exception) { JSONObject() }
 
-    fun fix(raw: String): String = load().optString(raw, raw)
+    /** A whole misread seen before, replaced by what the user said it really was. */
+    fun fix(raw: String): String = load("map").optString(raw, raw)
 
     fun teach(raw: String, truth: String) {
         if (raw.isEmpty() || raw == truth) return
-        val o = load()
+        val o = load("map")
         o.put(raw, truth)
         // If the corrected plate was itself a learned wrong read, drop that entry.
         if (o.has(truth) && o.optString(truth) != truth) o.remove(truth)
-        sp.edit().putString("map", o.toString()).apply()
+        // Character mix-ups (for example 8 read where the plate has B), counted per pair.
+        val pairs = load("pairs")
+        if (raw.length == truth.length) {
+            for (i in raw.indices) {
+                if (raw[i] != truth[i]) {
+                    val k = "" + raw[i] + ">" + truth[i]
+                    pairs.put(k, pairs.optInt(k, 0) + 1)
+                }
+            }
+        }
+        sp.edit().putString("map", o.toString()).putString("pairs", pairs.toString()).apply()
     }
 
-    fun count(): Int = load().length()
+    /**
+     * True when [read] differs from [plate] only by character mix-ups the user has corrected before
+     * (at most two of them), so the read is very likely that plate.
+     */
+    fun explains(read: String, plate: String): Boolean {
+        if (read.length != plate.length || read == plate) return false
+        val pairs = load("pairs")
+        var diffs = 0
+        for (i in read.indices) {
+            if (read[i] != plate[i]) {
+                diffs++
+                if (diffs > 2 || pairs.optInt("" + read[i] + ">" + plate[i], 0) < 1) return false
+            }
+        }
+        return diffs > 0
+    }
+
+    fun count(): Int = load("map").length()
 }

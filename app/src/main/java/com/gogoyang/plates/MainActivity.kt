@@ -31,6 +31,7 @@ import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.EditText
 import android.widget.FrameLayout
+import android.widget.GridView
 import android.widget.LinearLayout
 import android.widget.ListView
 import android.widget.TextView
@@ -71,10 +72,10 @@ class MainActivity : ComponentActivity() {
     // Guide frame as a share of the preview: wide, tall enough for two-line plates, sitting in the upper part.
     // The area read by the recognizer is computed from this same frame, so they always match.
     // Narrow, tall window like the handheld unit: hold the phone close so the plate fills it.
-    private val gLeft = 0.27f
-    private val gWidth = 0.46f
-    private val gTop = 0.04f
-    private val gHeight = 0.80f
+    private val gLeft = 0.22f
+    private val gWidth = 0.56f
+    private val gTop = 0.02f
+    private val gHeight = 0.86f
     @Volatile private var pvW = 0
     @Volatile private var pvH = 0
 
@@ -86,6 +87,8 @@ class MainActivity : ComponentActivity() {
     private val cands = LinkedHashMap<String, Int>()
     private var candsTime = 0L
     private var candKey = ""
+    private var currentPlate = ""
+    private var lastAnyRead = 0L
     private lateinit var statusBox: LinearLayout
     private lateinit var tvLabel: TextView
     private lateinit var tvPlate: TextView
@@ -194,16 +197,12 @@ class MainActivity : ComponentActivity() {
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(cBg)
-            setPadding(dp(12), dp(10), dp(12), dp(10))
+            setPadding(dp(10), dp(4), dp(10), dp(6))
         }
 
         val header = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
-        val title = TextView(this).apply {
-            text = "車牌開單查詢"; textSize = 18f; setTextColor(cInk); typeface = Typeface.DEFAULT_BOLD
-        }
-        header.addView(title, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        tvCount = TextView(this).apply { textSize = 14f; setTextColor(cMuted) }
-        header.addView(tvCount)
+        tvCount = TextView(this).apply { textSize = 16f; setTextColor(cInk); typeface = Typeface.DEFAULT_BOLD }
+        header.addView(tvCount, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         val btnExport = button("匯出", Color.WHITE, cInk, 14f).apply { minHeight = dp(40); minimumHeight = dp(40) }
         btnExport.setOnClickListener { exportList() }
         val btnClear = button("清除", Color.WHITE, cNo, 14f).apply { minHeight = dp(40); minimumHeight = dp(40) }
@@ -227,7 +226,7 @@ class MainActivity : ComponentActivity() {
         modeRow.addView(btnMark, mp())
         modeRow.addView(btnCheck, mp())
         modeRow.addView(btnScan, mp())
-        root.addView(modeRow, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(8) })
+        root.addView(modeRow, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(4) })
 
         val previewFrame = FrameLayout(this).apply { background = rounded(Color.BLACK, 12) }
         previewView = PreviewView(this)
@@ -272,28 +271,30 @@ class MainActivity : ComponentActivity() {
         }
         btnTorch.setOnClickListener { toggleTorch() }
         previewFrame.addView(btnTorch, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(36), Gravity.BOTTOM or Gravity.END).apply { rightMargin = dp(6); bottomMargin = dp(6) })
-        root.addView(previewFrame, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 2.6f).apply { topMargin = dp(8) })
+        root.addView(previewFrame, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 3.0f).apply { topMargin = dp(4) })
 
         statusBox = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER_HORIZONTAL
-            setPadding(dp(12), dp(10), dp(12), dp(10))
+            setPadding(dp(10), dp(4), dp(10), dp(6))
         }
-        tvLabel = TextView(this).apply { textSize = 26f; typeface = Typeface.DEFAULT_BOLD; gravity = Gravity.CENTER }
+        tvLabel = TextView(this).apply { textSize = 20f; typeface = Typeface.DEFAULT_BOLD; gravity = Gravity.CENTER }
         tvPlate = TextView(this).apply {
-            textSize = 40f; typeface = Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD)
+            textSize = 34f; typeface = Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD)
             setTextColor(Color.BLACK); gravity = Gravity.CENTER
             background = rounded(Color.WHITE, 8, Color.BLACK, 3)
             setPadding(dp(16), dp(2), dp(16), dp(2))
             letterSpacing = 0.05f
         }
-        tvDetail = TextView(this).apply { textSize = 14f; gravity = Gravity.CENTER }
+        // Tap the plate to fix it; the fix is remembered for next time.
+        tvPlate.setOnClickListener { if (currentPlate.isNotEmpty()) correctDisplayed(currentPlate) }
+        tvDetail = TextView(this).apply { textSize = 13f; gravity = Gravity.CENTER }
         actionsRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER }
         statusBox.addView(tvLabel)
         statusBox.addView(tvPlate, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(4) })
         statusBox.addView(tvDetail)
         statusBox.addView(actionsRow, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(6) })
-        root.addView(statusBox, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(8) })
+        root.addView(statusBox, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(4) })
 
         val entry = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         etPlate = EditText(this).apply {
@@ -315,21 +316,25 @@ class MainActivity : ComponentActivity() {
         })
         val btnGo = button("送出", cAccent, Color.WHITE)
         btnGo.setOnClickListener { submit(etPlate.text.toString()) }
-        entry.addView(etPlate, LinearLayout.LayoutParams(0, dp(56), 1f))
-        entry.addView(btnGo, LinearLayout.LayoutParams(dp(84), dp(56)).apply { leftMargin = dp(8) })
-        root.addView(entry, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(8) })
+        entry.addView(etPlate, LinearLayout.LayoutParams(0, dp(50), 1f))
+        entry.addView(btnGo, LinearLayout.LayoutParams(dp(80), dp(50)).apply { leftMargin = dp(8) })
+        root.addView(entry, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(4) })
 
-        tvHint = TextView(this).apply { textSize = 14f; setTextColor(cMuted); setPadding(dp(4), dp(4), dp(4), 0) }
+        tvHint = TextView(this).apply { textSize = 14f; setTextColor(cMuted); setPadding(dp(4), dp(2), dp(4), 0); visibility = View.GONE }
         root.addView(tvHint)
 
-        val listView = ListView(this).apply {
+        // Two columns so more plates fit on screen.
+        val listView = GridView(this).apply {
             background = rounded(Color.WHITE, 12)
-            divider = null
+            numColumns = 2
+            setPadding(dp(4), dp(4), dp(4), dp(4))
         }
         adapter = object : ArrayAdapter<String>(this, android.R.layout.simple_list_item_1) {
             override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
                 val v = super.getView(position, convertView, parent) as TextView
-                v.textSize = 22f
+                v.textSize = 19f
+                v.minHeight = dp(40)
+                v.setPadding(dp(8), dp(4), dp(4), dp(4))
                 v.typeface = Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD)
                 v.setTextColor(cInk)
                 return v
@@ -348,7 +353,7 @@ class MainActivity : ComponentActivity() {
                 }
                 .show()
         }
-        root.addView(listView, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1.6f).apply { topMargin = dp(6) })
+        root.addView(listView, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 2.4f).apply { topMargin = dp(4) })
         return root
     }
 
@@ -372,13 +377,14 @@ class MainActivity : ComponentActivity() {
 
     private fun refreshList() {
         adapter.clear()
-        adapter.addAll(store.records.map { PlateLogic.format(it.plate) + "      " + hhmm(it.t) })
-        tvCount.text = store.date + " · 已開單 " + store.records.size + " 台  "
+        adapter.addAll(store.records.map { PlateLogic.format(it.plate) + "  " + hhmm(it.t) })
+        tvCount.text = store.date + " · 已開單 " + store.records.size + " 台"
     }
 
     private fun updateHint() {
         val q = PlateLogic.normalize(etPlate.text.toString())
         val hits = PlateLogic.search(q, store.records)
+        tvHint.visibility = if (hits.isEmpty()) View.GONE else View.VISIBLE
         tvHint.text = if (hits.isEmpty()) "" else "已開單中符合：" + hits.take(6).joinToString("、") { PlateLogic.format(it.plate) }
     }
 
@@ -406,13 +412,8 @@ class MainActivity : ComponentActivity() {
         tvDetail.setTextColor(fg)
         tvPlate.visibility = if (plate.isEmpty()) View.GONE else View.VISIBLE
         tvPlate.text = PlateLogic.format(plate)
-
-        // Plates read by the camera can be corrected; the correction is remembered.
+        currentPlate = if (hold) "" else plate
         val shown = actions.toMutableList()
-        if (plate.isNotEmpty() && lastRaw.isNotEmpty() && !hold) {
-            val fix: Pair<String, () -> Unit> = "更正車牌" to { correctDisplayed(plate) }
-            shown.add(fix)
-        }
         actionsRow.removeAllViews()
         // Three or more choices (camera candidates) stack as a list of large plate buttons.
         val list = shown.size > 2 || label == "請點選正確車牌"
@@ -683,10 +684,17 @@ class MainActivity : ComponentActivity() {
     private fun onSeen(raw: String, started: Long) {
         if (awaiting) return
         val now = SystemClock.elapsedRealtime()
-        val plate = learn.fix(raw)
-        // Same car still in front of the camera, including small misreads of it: ignore.
-        if (lastAccepted.isNotEmpty() && now - lastAcceptedTime < 2500 &&
-            (plate == lastAccepted || PlateLogic.fold(plate) == PlateLogic.fold(lastAccepted) || PlateLogic.lev1(plate, lastAccepted))
+        val gap = now - lastAnyRead
+        lastAnyRead = now
+        val fixed = learn.fix(raw)
+        // A read that differs from a listed plate only by mix-ups the user corrected before is that plate.
+        val plate = if (store.find(fixed) != null) fixed
+            else store.records.firstOrNull { learn.explains(fixed, it.plate) }?.plate ?: fixed
+        // One car, one plate: after a plate is taken, every reading is ignored while plates keep
+        // being read without a break (the same car seen from other angles). A new car starts once
+        // the window has been empty for a moment. Small misreads of the last plate are ignored too.
+        if (lastAccepted.isNotEmpty() && (gap < 700 ||
+                (now - lastAcceptedTime < 2500 && (plate == lastAccepted || PlateLogic.fold(plate) == PlateLogic.fold(lastAccepted) || PlateLogic.lev1(plate, lastAccepted))))
         ) {
             lastAcceptedTime = now
             return
