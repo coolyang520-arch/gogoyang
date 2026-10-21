@@ -3,7 +3,6 @@ package com.gogoyang.plates
 import android.Manifest
 import android.app.AlertDialog
 import android.content.Context
-import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.Color
@@ -18,30 +17,27 @@ import android.os.Bundle
 import android.os.SystemClock
 import android.os.VibrationEffect
 import android.os.Vibrator
-import android.text.Editable
-import android.text.InputType
-import android.text.TextWatcher
+import android.util.LruCache
 import android.util.Size
 import android.view.Gravity
+import android.view.KeyEvent
 import android.view.View
 import android.view.ViewGroup
 import android.view.WindowManager
-import android.view.inputmethod.EditorInfo
-import android.widget.ArrayAdapter
+import android.widget.BaseAdapter
 import android.widget.Button
-import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.GridView
+import android.widget.ImageView
 import android.widget.LinearLayout
-import android.widget.ListView
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.camera.core.Camera
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
-import androidx.camera.core.Camera
 import androidx.camera.core.Preview
 import androidx.camera.core.UseCaseGroup
 import androidx.camera.core.resolutionselector.AspectRatioStrategy
@@ -50,9 +46,7 @@ import androidx.camera.core.resolutionselector.ResolutionStrategy
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
-import com.google.mlkit.vision.common.InputImage
-import com.google.mlkit.vision.text.TextRecognition
-import com.google.mlkit.vision.text.latin.TextRecognizerOptions
+import org.opencv.android.OpenCVLoader
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -69,77 +63,71 @@ class MainActivity : ComponentActivity() {
     private val cNo = Color.parseColor("#C62828")
     private val cWarn = Color.parseColor("#E0A100")
 
-    // Guide frame as a share of the preview: wide, tall enough for two-line plates, sitting in the upper part.
-    // The area read by the recognizer is computed from this same frame, so they always match.
-    // Narrow, tall window like the handheld unit: hold the phone close so the plate fills it.
-    private val gLeft = 0.22f
-    private val gWidth = 0.56f
-    private val gTop = 0.02f
-    private val gHeight = 0.86f
+    // Guide frame as a share of the preview: the scooter rear fills it, the plate sits in the
+    // dashed box inside (see Decide). Only this area is photographed and compared, so a
+    // neighbouring scooter at the edge of the picture is left out: one photo, one scooter.
+    private val gLeft = 0.08f
+    private val gWidth = 0.84f
+    private val gTop = 0.03f
+    private val gHeight = 0.94f
     @Volatile private var pvW = 0
     @Volatile private var pvH = 0
 
     private lateinit var store: Store
-    private lateinit var learn: Learn
     private lateinit var previewView: PreviewView
     private lateinit var guide: View
     private lateinit var mask: MaskView
-    private val cands = LinkedHashMap<String, Int>()
-    private var candsTime = 0L
-    private var candKey = ""
-    private var currentPlate = ""
-    private var lastAnyRead = 0L
-    private var acceptedAt = 0L
     private lateinit var statusBox: LinearLayout
     private lateinit var tvLabel: TextView
-    private lateinit var tvPlate: TextView
+    private lateinit var photoRow: LinearLayout
     private lateinit var tvDetail: TextView
     private lateinit var actionsRow: LinearLayout
-    private lateinit var etPlate: EditText
-    private lateinit var tvHint: TextView
     private lateinit var tvCount: TextView
-    private lateinit var adapter: ArrayAdapter<String>
+    private lateinit var tvInfo: TextView
+    private lateinit var adapter: BaseAdapter
     private lateinit var btnMark: Button
     private lateinit var btnCheck: Button
-    private lateinit var btnScan: Button
-
-    private var mode = "mark"
-    private var scanOn = true
-    private var awaiting = false
-    private var lastRaw = ""
-    private val reads = ArrayList<Pair<Long, String>>()
-    private var lastAccepted = ""
-    private var lastAcceptedTime = 0L
-    private var cameraStarted = false
-    private var pendingCameraStart = false
-    @Volatile private var busy = false
-    private var camera: Camera? = null
-    private var torchOn = false
-    private var avgMs = 0f
-    private var lastDecideMs = 0L
-    private lateinit var tvSpeed: TextView
+    private lateinit var btnShoot: Button
     private lateinit var btnTorch: Button
 
-    private val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
+    private var mode = "mark"
+    private var cvReady = false
+    private var cameraStarted = false
+    private var pendingCameraStart = false
+    private var camera: Camera? = null
+    private var torchOn = false
+    // Set when the shutter is pressed; the next camera frame becomes the photo.
+    @Volatile private var wantShot = false
+    @Volatile private var shotRecs: List<Rec> = emptyList()
+    private var busy = false
+    private var shotMode = "mark"
+
+    private val thumbs = object : LruCache<String, Bitmap>(16 * 1024 * 1024) {
+        override fun sizeOf(key: String, value: Bitmap): Int = value.byteCount
+    }
     private val executor = Executors.newSingleThreadExecutor()
     private var tone: ToneGenerator? = null
 
+    /** A photo just taken, with its fingerprint, waiting to be recorded or compared. */
+    private class Shot(val photo: Bitmap, val feat: Feat)
+
     private val permLauncher = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         if (granted) startCamera() else {
-            showStatus("warn", "沒有相機權限", "", "請到手機設定允許相機，或直接輸入車牌。", emptyList(), false)
+            showStatus("warn", "沒有相機權限", "請到手機設定允許相機。", emptyList(), emptyList())
         }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        cvReady = try { OpenCVLoader.initLocal() } catch (e: Throwable) { false }
         store = Store(this)
         store.load(todayStr())
-        learn = Learn(this)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         setContentView(buildUi())
         refreshList()
         updateModeUi()
         showIdle()
+        if (!cvReady) showStatus("warn", "比對元件無法載入", "這支手機無法執行照片比對。", emptyList(), emptyList())
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
             startCamera()
         } else {
@@ -151,15 +139,24 @@ class MainActivity : ComponentActivity() {
         super.onResume()
         if (store.date != todayStr()) {
             store.reset(todayStr())
+            thumbs.evictAll()
             refreshList()
         }
     }
 
     override fun onDestroy() {
         super.onDestroy()
-        recognizer.close()
         executor.shutdown()
         tone?.release()
+    }
+
+    // Volume keys work as a shutter, so the phone can be used with one hand.
+    override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
+        if (keyCode == KeyEvent.KEYCODE_VOLUME_DOWN || keyCode == KeyEvent.KEYCODE_VOLUME_UP) {
+            if (event?.repeatCount == 0) shoot()
+            return true
+        }
+        return super.onKeyDown(keyCode, event)
     }
 
     // ---------- helpers ----------
@@ -192,6 +189,10 @@ class MainActivity : ComponentActivity() {
             minimumHeight = dp(48)
             setPadding(dp(14), 0, dp(14), 0)
         }
+    private fun thumb(id: String): Bitmap? =
+        thumbs.get(id) ?: store.photo(id, 4)?.also { thumbs.put(id, it) }
+    /** Number of a record as the officer counts them: the first scooter of the day is 1. */
+    private fun number(r: Rec): Int = store.records.size - store.records.indexOf(r)
 
     // ---------- UI ----------
     private fun buildUi(): LinearLayout {
@@ -204,29 +205,18 @@ class MainActivity : ComponentActivity() {
         val header = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
         tvCount = TextView(this).apply { textSize = 16f; setTextColor(cInk); typeface = Typeface.DEFAULT_BOLD }
         header.addView(tvCount, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        val btnExport = button("匯出", Color.WHITE, cInk, 14f).apply { minHeight = dp(40); minimumHeight = dp(40) }
-        btnExport.setOnClickListener { exportList() }
         val btnClear = button("清除", Color.WHITE, cNo, 14f).apply { minHeight = dp(40); minimumHeight = dp(40) }
         btnClear.setOnClickListener { confirmClear() }
-        val hp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(40)).apply { leftMargin = dp(8) }
-        header.addView(btnExport, hp)
-        header.addView(btnClear, LinearLayout.LayoutParams(hp))
+        header.addView(btnClear, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(40)).apply { leftMargin = dp(8) })
         root.addView(header)
 
         val modeRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         btnMark = button("第一圈・記錄", Color.WHITE, cMuted, 15f)
         btnCheck = button("第二圈・巡查", Color.WHITE, cMuted, 15f)
-        btnScan = button("鏡頭：開", Color.WHITE, cMuted, 15f)
         btnMark.setOnClickListener { setMode("mark") }
         btnCheck.setOnClickListener { setMode("check") }
-        btnScan.setOnClickListener {
-            scanOn = !scanOn
-            updateModeUi()
-        }
-        val mp = { LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { rightMargin = dp(6) } }
-        modeRow.addView(btnMark, mp())
-        modeRow.addView(btnCheck, mp())
-        modeRow.addView(btnScan, mp())
+        modeRow.addView(btnMark, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { rightMargin = dp(6) })
+        modeRow.addView(btnCheck, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         root.addView(modeRow, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(4) })
 
         val previewFrame = FrameLayout(this).apply { background = rounded(Color.BLACK, 12) }
@@ -249,6 +239,8 @@ class MainActivity : ComponentActivity() {
                 previewView.post { startCamera() }
             }
         }
+        // Tapping the picture also takes the photo.
+        previewView.setOnClickListener { shoot() }
         mask = MaskView(this)
         previewFrame.addView(mask, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
         guide = View(this).apply { background = GradientDrawable().apply {
@@ -257,22 +249,26 @@ class MainActivity : ComponentActivity() {
             setStroke(dp(3), Color.WHITE)
         } }
         previewFrame.addView(guide, FrameLayout.LayoutParams(dp(260), dp(120)))
-        tvSpeed = TextView(this).apply {
-            text = "車牌放進框內"
+        tvInfo = TextView(this).apply {
+            text = "車尾放進白框，車牌對準黃色虛線框"
             textSize = 12f
             setTextColor(Color.WHITE)
             setBackgroundColor(Color.parseColor("#99000000"))
             setPadding(dp(6), dp(2), dp(6), dp(2))
         }
-        previewFrame.addView(tvSpeed, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM or Gravity.START).apply { leftMargin = dp(6); bottomMargin = dp(6) })
+        previewFrame.addView(tvInfo, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM or Gravity.START).apply { leftMargin = dp(6); bottomMargin = dp(6) })
         btnTorch = button("補光", Color.parseColor("#99000000"), Color.WHITE, 13f).apply {
             minHeight = dp(36); minimumHeight = dp(36)
             setPadding(dp(12), 0, dp(12), 0)
             visibility = View.GONE
         }
         btnTorch.setOnClickListener { toggleTorch() }
-        previewFrame.addView(btnTorch, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(36), Gravity.BOTTOM or Gravity.END).apply { rightMargin = dp(6); bottomMargin = dp(6) })
+        previewFrame.addView(btnTorch, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(36), Gravity.TOP or Gravity.END).apply { rightMargin = dp(6); topMargin = dp(6) })
         root.addView(previewFrame, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 3.0f).apply { topMargin = dp(4) })
+
+        btnShoot = button("拍照", cAccent, Color.WHITE, 20f)
+        btnShoot.setOnClickListener { shoot() }
+        root.addView(btnShoot, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(56)).apply { topMargin = dp(6) })
 
         statusBox = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -280,87 +276,55 @@ class MainActivity : ComponentActivity() {
             setPadding(dp(10), dp(4), dp(10), dp(6))
         }
         tvLabel = TextView(this).apply { textSize = 20f; typeface = Typeface.DEFAULT_BOLD; gravity = Gravity.CENTER }
-        tvPlate = TextView(this).apply {
-            textSize = 34f; typeface = Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD)
-            setTextColor(Color.BLACK); gravity = Gravity.CENTER
-            background = rounded(Color.WHITE, 8, Color.BLACK, 3)
-            setPadding(dp(16), dp(2), dp(16), dp(2))
-            letterSpacing = 0.05f
-        }
-        // Tap the plate to fix it; the fix is remembered for next time.
-        tvPlate.setOnClickListener { if (currentPlate.isNotEmpty()) correctDisplayed(currentPlate) }
+        photoRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER }
         tvDetail = TextView(this).apply { textSize = 13f; gravity = Gravity.CENTER }
         actionsRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER }
         statusBox.addView(tvLabel)
-        statusBox.addView(tvPlate, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(4) })
+        statusBox.addView(photoRow, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(4) })
         statusBox.addView(tvDetail)
         statusBox.addView(actionsRow, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(6) })
-        root.addView(statusBox, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(4) })
+        root.addView(statusBox, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(6) })
 
-        val entry = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        etPlate = EditText(this).apply {
-            hint = "輸入車牌"
-            textSize = 24f
-            typeface = Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD)
-            setTextColor(cInk)
-            setSingleLine()
-            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
-            imeOptions = EditorInfo.IME_ACTION_GO
-            background = rounded(Color.WHITE, 12, Color.parseColor("#C6CFD8"), 2)
-            setPadding(dp(14), dp(8), dp(14), dp(8))
-        }
-        etPlate.setOnEditorActionListener { _, _, _ -> submit(etPlate.text.toString()); true }
-        etPlate.addTextChangedListener(object : TextWatcher {
-            override fun beforeTextChanged(s: CharSequence?, st: Int, c: Int, a: Int) {}
-            override fun onTextChanged(s: CharSequence?, st: Int, b: Int, c: Int) {}
-            override fun afterTextChanged(s: Editable?) { updateHint() }
-        })
-        val btnGo = button("送出", cAccent, Color.WHITE)
-        btnGo.setOnClickListener { submit(etPlate.text.toString()) }
-        entry.addView(etPlate, LinearLayout.LayoutParams(0, dp(50), 1f))
-        entry.addView(btnGo, LinearLayout.LayoutParams(dp(80), dp(50)).apply { leftMargin = dp(8) })
-        root.addView(entry, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(4) })
-
-        tvHint = TextView(this).apply { textSize = 14f; setTextColor(cMuted); setPadding(dp(4), dp(2), dp(4), 0); visibility = View.GONE }
-        root.addView(tvHint)
-
-        // Two columns so more plates fit on screen.
-        val listView = GridView(this).apply {
+        // Today's scooters as photos, newest first.
+        val grid = GridView(this).apply {
             background = rounded(Color.WHITE, 12)
-            numColumns = 2
+            numColumns = 4
+            horizontalSpacing = dp(4)
+            verticalSpacing = dp(4)
             setPadding(dp(4), dp(4), dp(4), dp(4))
         }
-        adapter = object : ArrayAdapter<String>(this, android.R.layout.simple_list_item_1) {
+        adapter = object : BaseAdapter() {
+            override fun getCount(): Int = store.records.size
+            override fun getItem(position: Int): Any = store.records[position]
+            override fun getItemId(position: Int): Long = position.toLong()
             override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
-                val v = super.getView(position, convertView, parent) as TextView
-                v.textSize = 19f
-                v.minHeight = dp(40)
-                v.setPadding(dp(8), dp(4), dp(4), dp(4))
-                v.typeface = Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD)
-                v.setTextColor(cInk)
-                return v
+                val cell = (convertView as? FrameLayout) ?: FrameLayout(this@MainActivity).apply {
+                    addView(ImageView(this@MainActivity).apply { scaleType = ImageView.ScaleType.CENTER_CROP },
+                        FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(84)))
+                    addView(TextView(this@MainActivity).apply {
+                        textSize = 11f
+                        setTextColor(Color.WHITE)
+                        setBackgroundColor(Color.parseColor("#99000000"))
+                        setPadding(dp(4), 0, dp(4), 0)
+                    }, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM or Gravity.START))
+                }
+                val r = store.records[position]
+                (cell.getChildAt(0) as ImageView).setImageBitmap(thumb(r.id))
+                (cell.getChildAt(1) as TextView).text = "#" + number(r) + " " + hhmm(r.t)
+                return cell
             }
         }
-        listView.adapter = adapter
-        listView.setOnItemClickListener { _, _, pos, _ ->
+        grid.adapter = adapter
+        grid.setOnItemClickListener { _, _, pos, _ ->
             val rec = store.records.getOrNull(pos) ?: return@setOnItemClickListener
-            AlertDialog.Builder(this)
-                .setTitle(PlateLogic.format(rec.plate))
-                .setItems(arrayOf("修改車牌", "刪除", "取消")) { _, which ->
-                    when (which) {
-                        0 -> askCorrect(rec.plate, rec.raw) { truth -> store.replace(rec, truth); refreshList() }
-                        1 -> { store.remove(rec); refreshList() }
-                    }
-                }
-                .show()
+            showRecordDialog(rec)
         }
-        root.addView(listView, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 2.4f).apply { topMargin = dp(4) })
+        root.addView(grid, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 2.0f).apply { topMargin = dp(6) })
         return root
     }
 
     private fun setMode(m: String) {
         mode = m
-        clearCands()
         updateModeUi()
         showIdle()
     }
@@ -372,34 +336,29 @@ class MainActivity : ComponentActivity() {
         }
         style(btnMark, mode == "mark")
         style(btnCheck, mode == "check")
-        btnScan.text = if (scanOn) "鏡頭：開" else "鏡頭：關"
-        style(btnScan, scanOn)
+        btnShoot.text = if (mode == "mark") "拍照記錄" else "拍照查詢"
     }
 
     private fun refreshList() {
-        adapter.clear()
-        adapter.addAll(store.records.map { PlateLogic.format(it.plate) + "  " + hhmm(it.t) })
+        adapter.notifyDataSetChanged()
         tvCount.text = store.date + " · 已開單 " + store.records.size + " 台"
     }
 
-    private fun updateHint() {
-        val q = PlateLogic.normalize(etPlate.text.toString())
-        val hits = PlateLogic.search(q, store.records)
-        tvHint.visibility = if (hits.isEmpty()) View.GONE else View.VISIBLE
-        tvHint.text = if (hits.isEmpty()) "" else "已開單中符合：" + hits.take(6).joinToString("、") { PlateLogic.format(it.plate) }
-    }
-
     private fun idleText(): String =
-        if (mode == "mark") "開完一台，對準車牌或輸入車牌，就記錄為已開單。"
-        else "對準車牌或輸入車牌，馬上顯示有沒有開過單。"
+        if (mode == "mark") "開完一台，拍車尾（含車牌）就記錄為已開單。同一台不會記兩次。"
+        else "拍車尾（含車牌），馬上顯示有沒有開過單。"
 
-    private fun showIdle() {
-        lastRaw = ""
-        showStatus("idle", "準備就緒", "", idleText(), emptyList(), false)
-    }
+    private fun showIdle() = showStatus("idle", "準備就緒", idleText(), emptyList(), emptyList())
 
-    private fun showStatus(kind: String, label: String, plate: String, detail: String, actions: List<Pair<String, () -> Unit>>, hold: Boolean, sound: Boolean = true) {
-        awaiting = hold
+    /**
+     * [photos] are shown side by side with a caption under each; tapping one calls its action if it has one.
+     * The first of [actions] is the main choice.
+     */
+    private fun showStatus(
+        kind: String, label: String, detail: String,
+        photos: List<Triple<Bitmap?, String, (() -> Unit)?>>,
+        actions: List<Pair<String, () -> Unit>>, sound: Boolean = true
+    ) {
         val (bg, fg) = when (kind) {
             "ok" -> cOk to Color.WHITE
             "no" -> cNo to Color.WHITE
@@ -411,22 +370,30 @@ class MainActivity : ComponentActivity() {
         tvLabel.setTextColor(fg)
         tvDetail.text = detail
         tvDetail.setTextColor(fg)
-        tvPlate.visibility = if (plate.isEmpty()) View.GONE else View.VISIBLE
-        tvPlate.text = PlateLogic.format(plate)
-        currentPlate = if (hold) "" else plate
-        val shown = actions.toMutableList()
+        photoRow.removeAllViews()
+        photoRow.visibility = if (photos.isEmpty()) View.GONE else View.VISIBLE
+        // Several candidates must fit across the screen; one or two comparison photos get more room.
+        val size = if (photos.size > 2) dp(76) else dp(120)
+        photos.forEach { (bmp, caption, onTap) ->
+            val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER_HORIZONTAL }
+            val iv = ImageView(this).apply {
+                scaleType = ImageView.ScaleType.CENTER_CROP
+                setImageBitmap(bmp)
+                background = rounded(Color.BLACK, 6, if (onTap != null) Color.WHITE else null, 3)
+                setPadding(dp(3), dp(3), dp(3), dp(3))
+                if (onTap != null) setOnClickListener { onTap() }
+            }
+            col.addView(iv, LinearLayout.LayoutParams(size, size))
+            col.addView(TextView(this).apply { text = caption; textSize = 12f; setTextColor(fg); gravity = Gravity.CENTER })
+            photoRow.addView(col, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { leftMargin = dp(4); rightMargin = dp(4) })
+        }
         actionsRow.removeAllViews()
-        // Three or more choices (camera candidates) stack as a list of large plate buttons.
-        val list = shown.size > 2 || label == "請點選正確車牌"
-        actionsRow.orientation = if (list) LinearLayout.VERTICAL else LinearLayout.HORIZONTAL
-        shown.forEachIndexed { i, a ->
-            val b = button(a.first, if (i == 0) Color.WHITE else Color.TRANSPARENT, if (i == 0) Color.BLACK else fg, if (list) 24f else 15f)
-            if (list) b.minWidth = dp(220)
+        actions.forEachIndexed { i, a ->
+            val b = button(a.first, if (i == 0) Color.WHITE else Color.TRANSPARENT, if (i == 0) Color.BLACK else fg, 15f)
             if (i != 0) b.background = rounded(Color.TRANSPARENT, 12, fg, 2)
             b.setOnClickListener { a.second() }
             actionsRow.addView(b, LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
                 leftMargin = dp(4); rightMargin = dp(4)
-                if (list) { topMargin = dp(3); bottomMargin = dp(3) }
             })
         }
         if (kind != "idle" && sound) feedback(kind)
@@ -448,108 +415,118 @@ class MainActivity : ComponentActivity() {
         } catch (e: Exception) { }
     }
 
-    // ---------- corrections ----------
-    private fun askCorrect(current: String, raw: String, onDone: (String) -> Unit) {
-        val et = EditText(this).apply {
-            setText(current)
-            setSelection(text.length)
-            textSize = 24f
-            typeface = Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD)
-            setSingleLine()
-            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS or InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS
+    private fun showRecordDialog(rec: Rec) {
+        val iv = ImageView(this).apply {
+            adjustViewBounds = true
+            setImageBitmap(store.photo(rec.id))
+            setPadding(dp(12), dp(8), dp(12), 0)
         }
-        val box = FrameLayout(this).apply { setPadding(dp(20), dp(8), dp(20), 0); addView(et) }
         AlertDialog.Builder(this)
-            .setTitle("更正車牌")
-            .setMessage("改成實車上的車牌。這次更正會被記住，下次同樣讀錯會自動改正。")
-            .setView(box)
-            .setPositiveButton("儲存") { _, _ ->
-                val truth = PlateLogic.normalize(et.text.toString())
-                if (truth.length < 3) {
-                    Toast.makeText(this, "請輸入至少 3 碼車牌", Toast.LENGTH_SHORT).show()
-                } else {
-                    if (raw.isNotEmpty() && raw != truth) learn.teach(raw, truth)
-                    onDone(truth)
-                }
-            }
+            .setTitle("#" + number(rec) + " · " + hhmm(rec.t) + " 開單")
+            .setView(iv)
+            .setPositiveButton("關閉", null)
+            .setNegativeButton("刪除") { _, _ -> confirmRemove(rec) }
+            .show()
+    }
+
+    private fun confirmRemove(rec: Rec) {
+        AlertDialog.Builder(this)
+            .setMessage("刪除 #" + number(rec) + "（" + hhmm(rec.t) + "）這台的記錄？")
+            .setPositiveButton("刪除") { _, _ -> store.remove(rec); thumbs.remove(rec.id); refreshList(); showIdle() }
             .setNegativeButton("取消", null)
             .show()
     }
 
-    private fun correctDisplayed(shown: String) {
-        val raw = lastRaw
-        askCorrect(shown, raw) { truth ->
-            if (mode == "mark") {
-                val rec = store.records.firstOrNull { it.plate == shown && it.raw == raw }
-                if (rec != null) {
-                    store.replace(rec, truth)
-                    refreshList()
-                    lastRaw = ""
-                    showStatus("ok", "已更正", truth, "已改成這個車牌，下次同樣讀錯會自動改正", emptyList(), false)
-                } else {
-                    lastRaw = ""
-                    submit(truth)
-                }
-            } else {
-                lastRaw = ""
-                submit(truth)
-            }
-        }
-    }
-
     // ---------- core flow ----------
-    private fun showFound(r: Rec) =
-        showStatus("ok", "已開單", r.plate, hhmm(r.t) + " 開單 · " + ago(r.t), emptyList(), false)
+    private fun mine(s: Shot): Triple<Bitmap?, String, (() -> Unit)?> = Triple(s.photo, "剛拍的", null)
+    private fun theirs(r: Rec, onTap: (() -> Unit)? = null): Triple<Bitmap?, String, (() -> Unit)?> =
+        Triple(thumb(r.id), "#" + number(r) + " " + hhmm(r.t), onTap)
 
-    private fun showRecorded(r: Rec) =
-        showStatus("ok", "已記錄", r.plate, "今天第 " + store.records.size + " 台",
-            listOf("復原" to { store.remove(r); refreshList(); showIdle() }), false)
-
-    private fun showMissing(n: String) {
-        val rr = lastRaw
-        showStatus("no", "未開單", n, "今天沒有這台的記錄",
-            listOf("標記為已開單" to { val r = store.add(n, rr); refreshList(); showRecorded(r) }), false)
+    private fun record(s: Shot) {
+        val r = store.add(s.photo, s.feat)
+        refreshList()
+        showStatus("ok", "已記錄", "今天第 " + store.records.size + " 台", listOf(theirs(r)),
+            listOf("復原" to { store.remove(r); thumbs.remove(r.id); refreshList(); showIdle() }))
     }
 
-    /** [readRaw] is what the camera read; empty for typed entries. */
-    private fun submit(raw: String, readRaw: String = "") {
-        if (store.date != todayStr()) { store.reset(todayStr()); refreshList() }
-        val n = PlateLogic.normalize(raw)
-        if (n.length < 3) {
-            Toast.makeText(this, "請輸入至少 3 碼車牌", Toast.LENGTH_SHORT).show()
+    private fun showAlready(s: Shot, r: Rec) =
+        showStatus("warn", "這台已記錄過", hhmm(r.t) + " 已記錄（#" + number(r) + "），沒有重複新增",
+            listOf(mine(s), theirs(r)), listOf("不同台，新增" to { record(s) }))
+
+    private fun showFound(s: Shot, r: Rec) =
+        showStatus("ok", "已開單", hhmm(r.t) + " 開單 · " + ago(r.t) + "　請對照兩張照片的車牌",
+            listOf(mine(s), theirs(r)), emptyList())
+
+    private fun showMissing(s: Shot) =
+        showStatus("no", "未開單", "今天沒有這台的記錄", listOf(mine(s)),
+            listOf("標記為已開單" to { record(s) }))
+
+    private fun shoot() {
+        if (!cvReady || !cameraStarted) return
+        if (busy) return
+        if (store.date != todayStr()) { store.reset(todayStr()); thumbs.evictAll(); refreshList() }
+        busy = true
+        shotMode = mode
+        shotRecs = store.records.toList()
+        btnShoot.isEnabled = false
+        btnShoot.text = "比對中…"
+        wantShot = true
+    }
+
+    private fun shotDone() {
+        busy = false
+        btnShoot.isEnabled = true
+        updateModeUi()
+    }
+
+    private fun onShot(s: Shot?, scores: Map<String, Int>, ms: Long) {
+        shotDone()
+        if (s == null) {
+            showStatus("warn", "拍照失敗", "請再拍一次。", emptyList(), emptyList())
             return
         }
-        lastRaw = readRaw
-        clearCands()
-        etPlate.setText("")
-        val exact = store.find(n)
-        var near = if (exact == null) PlateLogic.findNear(n, store.records) else emptyList()
-        if (mode == "mark" && exact == null && near.isEmpty()) {
-            // Recorded in the last minute and differing by at most two characters: probably the same car read differently.
-            val cutoff = System.currentTimeMillis() - 60000
-            near = store.records.filter { it.t >= cutoff && PlateLogic.diff(n, it.plate) <= 2 }
+        val sorted = scores.values.sortedDescending()
+        tvInfo.text = "比對 " + scores.size + " 台 · 最像 " + (sorted.getOrNull(0) ?: 0) +
+            " / 次像 " + (sorted.getOrNull(1) ?: 0) + " · " + ms + " 毫秒"
+        if (s.feat.n < Decide.MIN_FEATURES) {
+            showStatus("warn", "照片看不清楚", "太暗、太模糊或太遠。靠近一點，必要時開補光再拍。", listOf(mine(s)), emptyList())
+            return
         }
-        if (mode == "mark") {
-            when {
-                exact != null -> showStatus("warn", "這台已記錄過", n, hhmm(exact.t) + " 已記錄，沒有重複新增", emptyList(), false)
-                near.isNotEmpty() -> showStatus("warn", "有相似車牌", n,
-                    "已記錄的 " + PlateLogic.format(near[0].plate) + "（" + hhmm(near[0].t) + "）很像，是同一台嗎？",
-                    listOf("不同台，新增" to { val r = store.add(n, readRaw); refreshList(); showRecorded(r) },
-                        "同一台，不新增" to {
-                            // The camera misread that car: remember the mix-up so it is recognised next time.
-                            if (readRaw.isNotEmpty()) learn.teach(readRaw, near[0].plate)
-                            showFound(near[0])
-                        }), true)
-                else -> { val r = store.add(n, readRaw); refreshList(); showRecorded(r) }
+        // Records may have been removed while the photo was being compared.
+        val v = Decide.decide(scores.filterKeys { store.find(it) != null })
+        if (shotMode == "mark") {
+            when (v) {
+                is Decide.Verdict.None -> record(s)
+                is Decide.Verdict.Same -> showAlready(s, store.find(v.id)!!)
+                is Decide.Verdict.Maybe -> {
+                    val r = store.find(v.id)!!
+                    showStatus("warn", "可能已記錄過", "和 #" + number(r) + "（" + hhmm(r.t) + "）有點像，對照車牌，是同一台嗎？",
+                        listOf(mine(s), theirs(r)),
+                        listOf("同一台，不新增" to { showAlready(s, r) }, "不同台，新增" to { record(s) }))
+                }
+                is Decide.Verdict.Several -> {
+                    val recs = v.ids.mapNotNull { store.find(it) }
+                    showStatus("warn", "有 " + recs.size + " 台很像", "點選同一台的照片；都不是就新增",
+                        listOf(mine(s)) + recs.map { r -> theirs(r) { showAlready(s, r) } },
+                        listOf("都不是，新增" to { record(s) }))
+                }
             }
         } else {
-            when {
-                exact != null -> showFound(exact)
-                near.isNotEmpty() -> showStatus("warn", "有相似車牌", n,
-                    "已開單的 " + PlateLogic.format(near[0].plate) + "（" + hhmm(near[0].t) + "）很像，是這台嗎？",
-                    listOf("是這台，已開單" to { showFound(near[0]) },
-                        "不是，未開單" to { showMissing(n) }), true)
-                else -> showMissing(n)
+            when (v) {
+                is Decide.Verdict.None -> showMissing(s)
+                is Decide.Verdict.Same -> showFound(s, store.find(v.id)!!)
+                is Decide.Verdict.Maybe -> {
+                    val r = store.find(v.id)!!
+                    showStatus("warn", "可能已開單", "和 #" + number(r) + "（" + hhmm(r.t) + "）有點像，對照車牌，是同一台嗎？",
+                        listOf(mine(s), theirs(r)),
+                        listOf("是，已開單" to { showFound(s, r) }, "不是，未開單" to { showMissing(s) }))
+                }
+                is Decide.Verdict.Several -> {
+                    val recs = v.ids.mapNotNull { store.find(it) }
+                    showStatus("warn", "有 " + recs.size + " 台很像", "點選同一台的照片；都不是就是未開單",
+                        listOf(mine(s)) + recs.map { r -> theirs(r) { showFound(s, r) } },
+                        listOf("都不是，未開單" to { showMissing(s) }))
+                }
             }
         }
     }
@@ -588,7 +565,7 @@ class MainActivity : ComponentActivity() {
                 btnTorch.visibility = if (cam.cameraInfo.hasFlashUnit()) View.VISIBLE else View.GONE
             } catch (e: Exception) {
                 cameraStarted = false
-                showStatus("warn", "相機無法啟動", "", "請直接輸入車牌。", emptyList(), false)
+                showStatus("warn", "相機無法啟動", "請關閉其他使用相機的程式後重開。", emptyList(), emptyList())
             }
         }, ContextCompat.getMainExecutor(this))
     }
@@ -602,35 +579,46 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
-     * Read only the guide-frame area. Frames are processed back to back:
-     * the next one starts as soon as the previous recognition finishes.
+     * Frames are dropped until the shutter is pressed. That frame's guide-frame area becomes the photo,
+     * which is fingerprinted and compared with every scooter recorded today, all on the worker thread.
      */
     private fun analyze(proxy: ImageProxy) {
-        if (!scanOn || busy) {
+        if (!wantShot) {
             proxy.close()
             return
         }
-        busy = true
+        wantShot = false
         val started = SystemClock.elapsedRealtime()
         val rot = proxy.imageInfo.rotationDegrees
         var crop: Bitmap? = null
         try {
             val src = proxy.toBitmap()
             val r = guideRect(src, proxy, rot)
-            crop = Bitmap.createBitmap(src, r.left, r.top, r.width(), r.height())
+            crop = Bitmap.createBitmap(src, r.left, r.top, r.width(), r.height(), Matrix().apply { postRotate(rot.toFloat()) }, true)
         } catch (e: Exception) {
             crop = null
         } finally {
             proxy.close()
         }
-        val bmp = crop
-        if (bmp == null) {
-            busy = false
-            return
+        var shot: Shot? = null
+        val scores = HashMap<String, Int>()
+        try {
+            if (crop != null) {
+                val photo = Matcher.shrink(crop)
+                val f = Matcher.extract(photo)
+                shot = Shot(photo, f)
+                if (f.n >= Decide.MIN_FEATURES) {
+                    for (rec in shotRecs) {
+                        val rf = store.feat(rec.id) ?: continue
+                        scores[rec.id] = Matcher.score(f, rf)
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            shot = null
         }
-        recognizer.process(InputImage.fromBitmap(bmp, rot))
-            .addOnSuccessListener { res -> onFrame(PlateLogic.extract(res.text), started) }
-            .addOnCompleteListener { busy = false }
+        val ms = SystemClock.elapsedRealtime() - started
+        runOnUiThread { onShot(shot, scores, ms) }
     }
 
     /** The guide frame mapped into the (unrotated) camera bitmap. */
@@ -653,7 +641,7 @@ class MainActivity : ComponentActivity() {
                 (vw * (gLeft + gWidth) - vw / 2f) / sc + w / 2f,
                 (vh * (gTop + gHeight) - vh / 2f) / sc + h / 2f
             )
-        } else RectF(w * 0.1f, h * 0.3f, w * 0.9f, h * 0.6f)
+        } else RectF(w * 0.1f, h * 0.05f, w * 0.9f, h * 0.95f)
         // Undo the rotation: upright coordinates -> bitmap coordinates.
         val m = Matrix()
         m.postRotate(rot.toFloat())
@@ -673,116 +661,11 @@ class MainActivity : ComponentActivity() {
         return out
     }
 
-    private fun onFrame(p: String?, started: Long) {
-        val ms = SystemClock.elapsedRealtime() - started
-        avgMs = if (avgMs == 0f) ms.toFloat() else avgMs * 0.8f + ms * 0.2f
-        updateSpeed()
-        if (p != null) onSeen(p, started)
-    }
-
-    private fun updateSpeed() {
-        val sb = StringBuilder("每張 ").append(avgMs.toInt()).append(" 毫秒")
-        if (lastDecideMs > 0) sb.append(" · 判定 ").append(String.format(Locale.US, "%.2f", lastDecideMs / 1000f)).append(" 秒")
-        tvSpeed.text = sb.toString()
-    }
-
-    /**
-     * Round 1 (record): a plate needs two identical reads with no competing reading, then it is recorded automatically.
-     * Round 2 (check): a plate already on today's list is taken from a single read and shown green at once.
-     * A plate not on the list is offered as a candidate; the officer taps the one that matches the real plate.
-     */
-    private fun onSeen(raw: String, started: Long) {
-        if (awaiting) return
-        val now = SystemClock.elapsedRealtime()
-        val gap = now - lastAnyRead
-        lastAnyRead = now
-        val fixed = learn.fix(raw)
-        // A read that differs from a listed plate only by mix-ups the user corrected before is that plate.
-        val plate = if (store.find(fixed) != null) fixed
-            else store.records.firstOrNull { learn.explains(fixed, it.plate) }?.plate ?: fixed
-        // One car, one plate: right after a plate is taken, ignore everything for a moment, then keep
-        // ignoring readings that differ from it by at most two characters (the same car seen from
-        // another angle) while they keep coming, up to a few seconds. A clearly different plate is a new car.
-        if (lastAccepted.isNotEmpty()) {
-            val sinceTaken = now - acceptedAt
-            if (sinceTaken < 900) return
-            if (PlateLogic.diff(plate, lastAccepted) <= 2 && now - lastAcceptedTime < 2500 && sinceTaken < 6000) {
-                lastAcceptedTime = now
-                return
-            }
-        }
-        val known = store.find(plate) != null
-        if (mode == "check") {
-            if (known) {
-                lastDecideMs = now - started
-                accept(plate, raw)
-                return
-            }
-            if (now - candsTime > 2000) cands.clear()  // a new car: drop the previous car's candidates
-            candsTime = now
-            cands[raw] = (cands[raw] ?: 0) + 1
-            showCandidates()
-            return
-        }
-        reads.add(started to raw)
-        reads.removeAll { now - it.first > 1500 }
-        val n = reads.count { it.second == raw }
-        val rival = reads.groupingBy { it.second }.eachCount().any { it.key != raw && it.value >= n }
-        if (!known && (n < 2 || rival)) return
-        lastDecideMs = now - reads.filter { it.second == raw }.minOf { it.first }
-        accept(plate, raw)
-    }
-
-    private fun accept(plate: String, raw: String) {
-        updateSpeed()
-        reads.clear()
-        lastAccepted = plate
-        lastAcceptedTime = SystemClock.elapsedRealtime()
-        acceptedAt = lastAcceptedTime
-        submit(plate, raw)
-    }
-
-    private fun clearCands() {
-        cands.clear()
-        candKey = ""
-    }
-
-    private fun showCandidates() {
-        val top = cands.entries.sortedByDescending { it.value }.take(4).map { it.key }
-        val key = top.joinToString(",")
-        if (key == candKey) return  // unchanged: keep the buttons still so a tap is not lost
-        val first = candKey.isEmpty()
-        candKey = key
-        val acts = top.map { raw ->
-            val label: Pair<String, () -> Unit> = PlateLogic.format(learn.fix(raw)) to { pickCandidate(raw) }
-            label
-        }
-        lastRaw = ""
-        showStatus("warn", "請點選正確車牌", "", "今天清單上沒有這台。點實車上的車牌，或直接輸入。", acts, false, first)
-    }
-
-    private fun pickCandidate(raw: String) {
-        val plate = learn.fix(raw)
-        lastDecideMs = 0
-        accept(plate, raw)
-    }
-
     // ---------- menu actions ----------
-    private fun exportList() {
-        if (store.records.isEmpty()) { Toast.makeText(this, "今天還沒有記錄", Toast.LENGTH_SHORT).show(); return }
-        val sb = StringBuilder("車牌,記錄時間\n")
-        store.records.reversed().forEach { sb.append(PlateLogic.format(it.plate)).append(',').append(store.date).append(' ').append(hhmm(it.t)).append('\n') }
-        val i = Intent(Intent.ACTION_SEND).apply {
-            type = "text/plain"
-            putExtra(Intent.EXTRA_TEXT, sb.toString())
-        }
-        startActivity(Intent.createChooser(i, "匯出今日清單"))
-    }
-
     private fun confirmClear() {
         AlertDialog.Builder(this)
-            .setMessage("清除今天全部 " + store.records.size + " 筆記錄？")
-            .setPositiveButton("清除") { _, _ -> store.reset(todayStr()); refreshList(); showIdle() }
+            .setMessage("清除今天全部 " + store.records.size + " 筆記錄和照片？")
+            .setPositiveButton("清除") { _, _ -> store.reset(todayStr()); thumbs.evictAll(); refreshList(); showIdle() }
             .setNegativeButton("取消", null)
             .show()
     }

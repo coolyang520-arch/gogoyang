@@ -2,7 +2,7 @@ name: Build APK
 
 on:
   push:
-    branches: [main]
+    branches-ignore: [build-logs]
   workflow_dispatch:
 
 permissions:
@@ -30,17 +30,28 @@ jobs:
       - name: Build APK
         run: gradle --no-daemon assembleDebug --stacktrace > build.log 2>&1
 
+      - name: Show logs (branches)
+        if: always() && github.ref != 'refs/heads/main'
+        run: tail -n 60 test.log; tail -n 150 build.log
+
+      - name: Upload APK (branches)
+        if: success() && github.ref != 'refs/heads/main'
+        uses: actions/upload-artifact@v4
+        with:
+          name: scooter-checker-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
+
       - name: Publish release
-        if: success()
+        if: success() && github.ref == 'refs/heads/main'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          cp app/build/outputs/apk/debug/app-debug.apk plate-checker.apk
+          cp app/build/outputs/apk/debug/app-debug.apk scooter-checker.apk
           gh release delete latest --yes --cleanup-tag || true
-          gh release create latest plate-checker.apk --title "車牌開單查詢 APK" --notes "Debug build from commit ${GITHUB_SHA::7}. Install on Android and allow installs from this source."
+          gh release create latest scooter-checker.apk --title "這台機車開過了沒 APK" --notes "Debug build from commit ${GITHUB_SHA::7}. Install on Android and allow installs from this source."
 
       - name: Publish logs
-        if: always()
+        if: always() && github.ref == 'refs/heads/main'
         run: |
           mkdir -p /tmp/logs
           cp build.log test.log /tmp/logs/ 2>/dev/null || true

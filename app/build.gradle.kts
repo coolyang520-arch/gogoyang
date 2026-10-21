@@ -11,8 +11,10 @@ android {
         applicationId = "com.gogoyang.plates"
         minSdk = 26
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = 2
+        versionName = "2.0"
+        // Phones only; leaving out the x86 builds keeps the OpenCV libraries out of the APK.
+        ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a") }
     }
 
     buildTypes {
@@ -39,8 +41,8 @@ dependencies {
     implementation("androidx.camera:camera-lifecycle:$camerax")
     implementation("androidx.camera:camera-view:$camerax")
 
-    // Bundled Latin text recognition model: works offline.
-    implementation("com.google.mlkit:text-recognition:16.0.1")
+    // Keypoint matching for comparing scooter photos, fully offline.
+    implementation("org.opencv:opencv:4.10.0")
 
     testImplementation("junit:junit:4.13.2")
 }
